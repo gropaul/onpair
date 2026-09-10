@@ -221,6 +221,7 @@ mod tests {
             max_dict_bits,
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(seed),
+            prune: None,
         };
         let TrainResult { dict, lpm } = train(&ArrowRows::new(&raw.data, &raw.offsets), &cfg);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
@@ -280,6 +281,7 @@ mod tests {
             max_dict_bits: 16,
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(42),
+            prune: None,
         };
         let TrainResult { dict: _, lpm } = train(&ArrowRows::new(&raw.data, &raw.offsets), &cfg);
         let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
@@ -287,6 +289,28 @@ mod tests {
             codes.len() < raw.data.len(),
             "parser did not use multi-byte tokens"
         );
+    }
+
+    /// Pruning may only ever remove tokens the merge tree can rebuild, so a
+    /// pruned dictionary still encodes and decodes every input exactly.
+    #[test]
+    fn roundtrip_with_pruning() {
+        let raw = make_raw(&make_user_strings(500));
+        for factor in [0.0, 1.0, 8.0] {
+            let cfg = TrainingConfig {
+                max_dict_bits: 12,
+                threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
+                seed: Some(42),
+                prune: Some(factor),
+            };
+            let TrainResult { dict, lpm } = train(&ArrowRows::new(&raw.data, &raw.offsets), &cfg);
+            let (codes, _) = encode_strings(&raw.data, &raw.offsets, &lpm);
+            assert_eq!(
+                decode_all(&codes, dict.as_view()),
+                raw.data,
+                "factor={factor}"
+            );
+        }
     }
 
     #[test]

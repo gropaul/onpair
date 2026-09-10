@@ -219,6 +219,7 @@ fn compress_column(bits: u8) -> Column<u64> {
         max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.5).unwrap(),
         seed: Some(42),
+        prune: None,
     };
     compress(&c.bytes, &c.offsets, cfg).unwrap()
 }
@@ -237,6 +238,7 @@ fn train_and_compress(bencher: Bencher, bits: u8) {
                 max_dict_bits: MaxDictBits::new(bits).unwrap(),
                 threshold: Threshold::new(0.5).unwrap(),
                 seed: Some(42),
+                prune: None,
             };
             compress(
                 divan::black_box(&c.bytes),

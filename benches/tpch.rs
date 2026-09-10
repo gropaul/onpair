@@ -204,6 +204,7 @@ fn build_column(col: &'static str, bits: u8) -> Column<u64> {
         max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
+        prune: None,
     };
     compress(&c.bytes, &c.offsets, cfg).unwrap()
 }
@@ -220,6 +221,7 @@ fn train_and_compress(bencher: Bencher, param: (&'static str, u8)) {
         max_dict_bits: MaxDictBits::new(bits).unwrap(),
         threshold: Threshold::new(0.2).unwrap(),
         seed: Some(42),
+        prune: None,
     };
     bencher
         .counter(divan::counter::BytesCount::new(c.total_bytes))

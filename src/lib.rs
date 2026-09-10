@@ -83,7 +83,9 @@ pub use crate::core::validate::{InvalidColumn, InvalidFrequencyIndex};
 pub use crate::decoding::{
     DECODE_PADDING, OutputTooSmall, decode_into, decoded_len, try_decode_into,
 };
-pub use crate::encoding::config::{Config, DEFAULT_CONFIG, Error, MaxDictBits, Threshold};
+pub use crate::encoding::config::{
+    Config, DEFAULT_CONFIG, Error, MaxDictBits, PruneFactor, Threshold,
+};
 pub use crate::encoding::parser::Parser;
 pub use crate::encoding::rows::Rows;
 

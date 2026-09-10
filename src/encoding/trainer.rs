@@ -14,8 +14,8 @@ use hashbrown::hash_table::Entry;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
-use crate::core::dictionary::{CompactDictionary, Dictionary, pad_raw};
-use crate::core::types::MAX_TOKEN_SIZE;
+use crate::core::dictionary::{CompactDictionary, Dictionary, code_bits_for_num_tokens, pad_raw};
+use crate::core::types::{MAX_TOKEN_SIZE, Token};
 use crate::encoding::config::{ThresholdSpec, TrainingConfig};
 use crate::encoding::lpm::LongestPrefixMatcher;
 use crate::encoding::rows::Rows;
@@ -326,6 +326,16 @@ fn discover_tokens<'a>(
     let mut lpm = LongestPrefixMatcher::new();
     lpm.reserve(dict_capacity);
 
+    // The pair each merged token came from, indexed by `id - 256`. Pruning
+    // replaces a dropped token by its pair, recursively.
+    let mut parents: Vec<[Token; 2]> = Vec::with_capacity(dict_capacity - 256);
+
+    // How often each token was the longest match, taken from the training walk
+    // itself so pruning needs no second pass. Only pruning reads it, so the
+    // merge loop maintains it only when pruning is on.
+    let counting = cfg.prune.is_some();
+    let mut counts: Vec<u32> = vec![0; if counting { dict_capacity } else { 0 }];
+
     let mut threshold: u8;
     let mut dyn_ctrl: Option<DynamicThresholdController> = None;
     match cfg.threshold {
@@ -359,6 +369,9 @@ fn discover_tokens<'a>(
         }
 
         let (mut prev_id, mut prev_len) = lpm.find_longest_match(row);
+        if counting {
+            counts[prev_id as usize] += 1;
+        }
         let mut pos = prev_len;
 
         if let Some(ref mut dyn_) = dyn_ctrl {
@@ -371,6 +384,9 @@ fn discover_tokens<'a>(
 
         while pos < row.len() {
             let (curr_id, curr_len) = lpm.find_longest_match(&row[pos..]);
+            if counting {
+                counts[curr_id as usize] += 1;
+            }
 
             if let Some(ref mut dyn_) = dyn_ctrl {
                 dyn_.on_bytes_scanned(curr_len);
@@ -387,6 +403,7 @@ fn discover_tokens<'a>(
                 if freq.increment(key) >= threshold {
                     let pair = &row[pos - prev_len..pos + curr_len];
                     let new_id = lpm.insert(pair);
+                    parents.push([prev_id, curr_id]);
                     dict_bytes.extend_from_slice(pair);
                     dict_offsets.push(dict_bytes.len() as u32);
 
@@ -417,11 +434,80 @@ fn discover_tokens<'a>(
     // Sort the tokens into final order, pad, and seal exactly once: the only
     // `CompactDictionary` that exists is sorted and read-padded by construction.
     // The merge-loop matcher used unsorted ids, so rebuild it from the sealed dict.
+    if let Some(factor) = cfg.prune {
+        counts.truncate(lpm.size());
+        (dict_bytes, dict_offsets) =
+            prune(&dict_bytes, &dict_offsets, &parents, &mut counts, factor);
+    }
+
     let (mut bytes, offsets) = sort_tokens(&dict_bytes, &dict_offsets);
     pad_raw(&mut bytes, &offsets);
     let dict = CompactDictionary::from_raw(bytes, offsets);
     let lpm = LongestPrefixMatcher::from_dictionary(dict.as_view());
     TrainResult { dict, lpm }
+}
+
+/// Codes a token expands into once the dead tokens around it are replaced by
+/// the pair they merged. Bounded by the token's byte length, so the recursion
+/// visits at most `2 * MAX_TOKEN_SIZE` nodes.
+fn expansion(id: usize, alive: &[bool], parents: &[[Token; 2]]) -> usize {
+    if alive[id] {
+        return 1;
+    }
+    let [l, r] = parents[id - 256];
+    expansion(l as usize, alive, parents) + expansion(r as usize, alive, parents)
+}
+
+/// Drop the tokens that do not pay for the dictionary space they occupy.
+///
+/// A token the sample never matches goes unconditionally; the rest are weighed
+/// least-matched first, dropping one whose footprint - its bytes plus its
+/// 4-byte offset, scaled by `factor` - exceeds the code-stream bytes it saves
+/// over emitting the pair it merged. A dropped token's matches move to that
+/// pair, so a survivor is judged against the work it will actually inherit.
+/// The 256 single-byte tokens are never candidates, so every input stays
+/// encodable. Returns fresh, unpadded `(bytes, offsets)` in id order.
+///
+/// `counts` must come from a walk of the sample against the *finished*
+/// dictionary. Counting as the table is built instead biases against every
+/// token merged late in the sample, which has almost no scan left to be matched
+/// in, and pruning on those counts loses on every corpus measured.
+fn prune(
+    bytes: &[u8],
+    offsets: &[u32],
+    parents: &[[Token; 2]],
+    counts: &mut [u32],
+    factor: f64,
+) -> (Vec<u8>, Vec<u32>) {
+    let n = offsets.len() - 1;
+    let code_bytes = f64::from(code_bits_for_num_tokens(n)) / 8.0;
+    let mut alive = vec![true; n];
+
+    let mut order: Vec<usize> = (256..n).collect();
+    order.sort_unstable_by_key(|&id| counts[id]);
+    for id in order {
+        let [l, r] = parents[id - 256];
+        let split = expansion(l as usize, &alive, parents) + expansion(r as usize, &alive, parents);
+        let len = (offsets[id + 1] - offsets[id]) as usize;
+        let footprint = (len + 4) as f64 * factor;
+        let saved = f64::from(counts[id]) * (split - 1) as f64 * code_bytes;
+        if counts[id] == 0 || footprint > saved {
+            alive[id] = false;
+            counts[l as usize] += counts[id];
+            counts[r as usize] += counts[id];
+        }
+    }
+
+    let mut out_bytes: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut out_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    out_offsets.push(0);
+    for id in 0..n {
+        if alive[id] {
+            out_bytes.extend_from_slice(&bytes[offsets[id] as usize..offsets[id + 1] as usize]);
+            out_offsets.push(out_bytes.len() as u32);
+        }
+    }
+    (out_bytes, out_offsets)
 }
 
 /// Sort the tokens into ascending bytewise-lexicographic order, returning fresh
@@ -514,6 +600,7 @@ pub(crate) mod tests {
             max_dict_bits: 12,
             threshold: ThresholdSpec::Fixed(FixedThreshold { value: 2 }),
             seed: Some(42),
+            prune: None,
         };
         let result = train_strings(&make_user_strings(500), &cfg);
         assert!(result.dict.num_tokens() <= max_dict_size(cfg.max_dict_bits));
@@ -655,6 +742,7 @@ pub(crate) mod tests {
                 sample_fraction: 1.0,
             }),
             seed: Some(42),
+            prune: None,
         };
         let result = train_strings(&make_user_strings(500), &cfg);
         assert!(result.dict.num_tokens() <= max_dict_size(cfg.max_dict_bits));
@@ -685,6 +773,7 @@ pub(crate) mod tests {
                             sample_fraction: fraction,
                         }),
                         seed: Some(42),
+                        prune: None,
                     };
                     let (order, start) = make_training_order(&rows, cfg.threshold, total_bytes, 42);
                     let selected_order = &order[start..];
@@ -732,6 +821,26 @@ pub(crate) mod tests {
         assert!(is_lex_sorted(
             train_strings(&make_user_strings(100), &cfg).dict.as_view()
         ));
+    }
+
+    #[test]
+    fn pruning_shrinks_the_dictionary_and_keeps_it_valid() {
+        let corpus = make_user_strings(500);
+        let mut prev = usize::MAX;
+        for factor in [0.0, 1.0, 8.0] {
+            let cfg = TrainingConfig {
+                max_dict_bits: 12,
+                seed: Some(42),
+                prune: Some(factor),
+                ..Default::default()
+            };
+            let result = train_strings(&corpus, &cfg);
+            check_base_tokens(result.dict.as_view());
+            assert!(is_lex_sorted(result.dict.as_view()), "factor={factor}");
+            let n = result.dict.num_tokens();
+            assert!(n <= prev, "factor={factor} grew the dictionary");
+            prev = n;
+        }
     }
 
     #[test]

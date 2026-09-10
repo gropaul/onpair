@@ -69,6 +69,36 @@ impl TryFrom<f64> for Threshold {
     }
 }
 
+/// Scale applied to a token's dictionary footprint when post-training pruning
+/// weighs it against the codes it saves. Larger prunes harder; `0.0` drops only
+/// the tokens the corpus never matches. Validated to a finite, non-negative
+/// value at construction.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PruneFactor(f64);
+
+impl PruneFactor {
+    /// Construct a [`PruneFactor`], returning [`Error::InvalidArg`] unless
+    /// `value` is finite and non-negative.
+    pub const fn new(value: f64) -> Result<Self, Error> {
+        match value >= 0.0 && value.is_finite() {
+            true => Ok(Self(value)),
+            false => Err(Error::InvalidArg),
+        }
+    }
+
+    /// Get the prune value
+    pub const fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for PruneFactor {
+    type Error = Error;
+    fn try_from(value: f64) -> Result<Self, Error> {
+        Self::new(value)
+    }
+}
+
 /// Training configuration. See [`DEFAULT_CONFIG`] for a reasonable starting
 /// point.
 #[derive(Copy, Clone, Debug)]
@@ -79,6 +109,8 @@ pub struct Config {
     pub threshold: Threshold,
     /// RNG seed for sampling; `None` means non-deterministic.
     pub seed: Option<u64>,
+    /// Post-training pruning; Pruning drops the tokens that are not used often after training.
+    pub prune: Option<PruneFactor>,
 }
 
 /// Reasonable starting point: dictionary capped at 4 096 tokens, dynamic
@@ -93,6 +125,7 @@ pub const DEFAULT_CONFIG: Config = Config {
         Err(_) => unreachable!(),
     },
     seed: Some(42),
+    prune: None,
 };
 
 impl Default for Config {
@@ -163,6 +196,7 @@ pub(crate) struct TrainingConfig {
     pub(crate) max_dict_bits: u8,
     pub(crate) threshold: ThresholdSpec,
     pub(crate) seed: Option<u64>,
+    pub(crate) prune: Option<f64>,
 }
 
 impl Default for TrainingConfig {
@@ -171,6 +205,7 @@ impl Default for TrainingConfig {
             max_dict_bits: 16,
             threshold: ThresholdSpec::default(),
             seed: None,
+            prune: None,
         }
     }
 }
@@ -183,6 +218,7 @@ impl From<Config> for TrainingConfig {
                 sample_fraction: c.threshold.value(),
             }),
             seed: c.seed,
+            prune: c.prune.map(|f| f.value()),
         }
     }
 }
