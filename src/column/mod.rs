@@ -19,8 +19,8 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::{
-    ContainsTable, PrefixQuery, analyze_prefilter, contains, equals, prefilter_candidates,
-    starts_with, tokenize,
+    BytesVerifier, ContainsTable, PrefixQuery, analyze_prefilter, contains, equals,
+    prefilter_candidates, prefilter_superset, starts_with, tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -232,6 +232,29 @@ impl<'a, O: Offset> ColumnView<'a, O> {
         rows
     }
 
+    /// Ascending indices of the rows containing `pattern`, from the SIMD
+    /// prefilter without the walk, each candidate verified by decoding it and
+    /// searching its bytes.
+    ///
+    /// The same scan as
+    /// [`rows_containing_prefiltered`](Self::rows_containing_prefiltered) with
+    /// [`BytesVerifier`] behind it instead of the alignment walk. Same rows,
+    /// same order; kept so the two verifiers can be compared on one column.
+    ///
+    /// # Panics
+    /// As [`rows_containing_prefiltered`](Self::rows_containing_prefiltered).
+    pub fn rows_containing_prefiltered_memmem<S: TokenFrequencyIndexStorage>(
+        &self,
+        pattern: &[u8],
+        frequencies: &TokenFrequencyIndex<S>,
+    ) -> Vec<usize> {
+        let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
+        let mut rows = Vec::new();
+        prefilter_superset(self.codes, self.row_offsets, &analysis, &mut rows);
+        BytesVerifier::new(pattern).retain(*self, &mut rows);
+        rows
+    }
+
     /// Ascending indices of the rows whose codes satisfy `pred`.
     fn select(&self, pred: impl Fn(&[Token]) -> bool) -> Vec<usize> {
         (0..self.num_rows())
@@ -440,7 +463,7 @@ mod tests {
         }
     }
 
-    /// The prefiltered path is an optimization of `rows_containing` and nothing
+    /// Both prefiltered paths are optimizations of `rows_containing` and nothing
     /// else: same rows, same order.
     #[test]
     fn prefiltered_search_agrees_with_rows_containing() {
@@ -473,6 +496,11 @@ mod tests {
                 view.rows_containing_prefiltered(needle, &freqs),
                 want,
                 "prefiltered {needle:?}"
+            );
+            assert_eq!(
+                view.rows_containing_prefiltered_memmem(needle, &freqs),
+                want,
+                "prefiltered memmem {needle:?}"
             );
         }
     }

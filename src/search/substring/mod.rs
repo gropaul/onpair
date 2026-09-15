@@ -17,6 +17,6 @@ mod verify;
 pub use contains::{ContainsTable, contains};
 pub use prefilter::{
     MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover, analyze_prefilter, prefilter_candidates,
-    prefilter_is_likely_profitable,
+    prefilter_is_likely_profitable, prefilter_superset,
 };
 pub use verify::BytesVerifier;

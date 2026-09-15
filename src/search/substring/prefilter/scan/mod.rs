@@ -122,6 +122,17 @@ pub(super) fn scan<O: Offset>(
     );
 }
 
+/// Execute a previously derived plan without the walk: every hit's row is a
+/// candidate. The superset [`execute`] would have verified.
+#[inline]
+pub(super) fn execute_superset<O: Offset>(
+    plan: ScanPlan,
+    input: ScanInput<'_, O>,
+    out: &mut Vec<usize>,
+) {
+    execute_check(plan, input, Check::Superset, out);
+}
+
 /// Execute a previously derived plan. This is the first stage that inspects
 /// code values. Every hit goes through `walk`, so the rows are exact.
 #[inline]
@@ -210,13 +221,12 @@ type Block = [Token; BLOCK];
 /// One block of mask, bit `i` for code `i` of the block.
 type Mask = [u64; BLOCK / 64];
 
-/// What stage two asks of a hit before its row goes out. Every scan the
-/// planner drives applies the walk; `Superset` is how the benches time the
-/// two stages without the walk's per-hit cost inside them.
+/// What stage two asks of a hit before its row goes out. The planner's
+/// scans apply the walk; `Superset` leaves verification to the caller, and
+/// is how the benches time the two stages without the walk's per-hit cost.
 #[derive(Clone, Copy)]
 enum Check<'a> {
     /// Nothing: every hit's row is a candidate.
-    #[cfg(test)]
     Superset,
     /// The alignment walk over the codes: only a hit some occurrence of the
     /// needle parses through has its row emitted.
@@ -233,7 +243,6 @@ impl Check<'_> {
     #[inline]
     fn passes(&self, code: usize, row_start: usize, row_end: usize) -> bool {
         match *self {
-            #[cfg(test)]
             Self::Superset => true,
             Self::Walk { walk, dict, codes } => walk.check(dict, codes, row_start, row_end, code),
         }

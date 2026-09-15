@@ -262,6 +262,34 @@ pub fn prefilter_candidates<O: Offset>(
     scan::execute(plan, input, &analysis.walk, dict, out);
 }
 
+/// Execute `analysis` and append the ascending rows holding a covered token,
+/// without the walk.
+///
+/// The result is a **sound superset** of the rows containing the pattern: the
+/// caller verifies the survivors with an exact check such as a
+/// [`BytesVerifier`](super::BytesVerifier) or [`contains`](super::contains()).
+/// This is the path [`prefilter_candidates`] is measured against; the walk
+/// replaces the per-row decode with a check on the codes around each hit.
+///
+/// Empty covers and empty patterns behave as in [`prefilter_candidates`].
+///
+/// # Precondition
+/// As [`prefilter_candidates`], minus the dictionary.
+pub fn prefilter_superset<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    analysis: &PrefilterAnalysis,
+    out: &mut Vec<usize>,
+) {
+    if analysis.matches_all {
+        out.extend(0..row_offsets.len().saturating_sub(1));
+        return;
+    }
+    let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
+    let plan = scan::plan(input, analysis);
+    scan::execute_superset(plan, input, out);
+}
+
 /// The longest pattern [`analyze_prefilter`] takes: one node per needle offset
 /// plus the sink, all of them inside the walk's `u16` ids.
 pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;

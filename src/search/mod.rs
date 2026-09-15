@@ -41,6 +41,8 @@
 //!   running a probe cover over the code stream. Every hit is verified against
 //!   the alignment graph in the compressed domain, so the rows are exact and
 //!   nothing verifies behind it.
+//! * [`prefilter_superset`] — the same scan without the walk: a sound superset
+//!   of the rows, for a caller that verifies them itself.
 //! * [`BytesVerifier`] — an exact check in the decoded domain: decode a row
 //!   into a reused buffer and `memmem` it. What the prefilter is measured
 //!   against, and the substring check without a pattern-length cap.
@@ -59,5 +61,6 @@ pub use prefix::{PrefixQuery, starts_with};
 pub use substring::{
     BytesVerifier, ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, ProbeCover,
     analyze_prefilter, contains, prefilter_candidates, prefilter_is_likely_profitable,
+    prefilter_superset,
 };
 pub use tokenize::tokenize;
