@@ -207,58 +207,55 @@ pub(super) fn ns_per_code(matcher: Match, shape: Shape) -> f64 {
     }
 }
 
-/// Fitted on `ch/hits/URL_1m` on an Apple M4 Pro, 2026-09-08, every kernel
-/// within 3.4% of its rows.
+/// Fitted on `ch/hits/URL_1m` on an Apple M4 Pro, 2026-09-15, over 4 Mcodes,
+/// every kernel within 2.3% of its rows. That core reads 99.5 GB/s at this
+/// size, so nothing under 0.02011 ns per code was reachable.
 #[cfg(target_arch = "aarch64")]
 fn neon(matcher: Match, shape: Shape) -> f64 {
     let k = shape.tokens as f64;
     let r = shape.ranges as f64;
     let batches = shape.tokens.div_ceil(PER_BATCH) as f64;
     match matcher {
-        Match::Table => 0.195,
-        Match::EqOr => 0.0043 + 0.0144 * k + 0.0205 * r,
-        Match::NibbleN8K => 0.0228 + 0.0325 * batches + 0.0213 * r,
-        Match::Range => 0.0043 + 0.0212 * r,
+        Match::Table => 0.184,
+        Match::EqOr => 0.00588 + 0.01380 * k + 0.04966 * r,
+        Match::NibbleN8K => 0.02325 + 0.03061 * batches + 0.06501 * r,
+        Match::Range => 0.00330 + 0.02103 * r,
     }
 }
 
-/// Fitted on `ch/hits/URL_1m` on an Intel Xeon 6975P-C, 2026-09-08. The
-/// stream was cut to fit L2 there, because on a 4 Mcode one that core pins
-/// every vector kernel at 31 GB/s, and a fit through capped rows describes
-/// the memory system rather than the kernel. So these are what the kernels
-/// cost when fed; nothing above 77 GB/s was reachable.
+/// Fitted on `ch/hits/URL_1m` on an AMD EPYC 9R14, a `c7a.xlarge`,
+/// 2026-09-15, over 4 Mcodes. Unlike the Intel core this replaces, that one
+/// reads the same 8 MiB stream at 92 GB/s as it reads 1 MiB, so the fit is
+/// the kernel and not the memory system; nothing under 0.02168 ns per code
+/// was reachable. Every kernel within 4.3% of its rows bar the byte table,
+/// at 9.1%.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 fn avx2(matcher: Match, shape: Shape) -> f64 {
     let k = shape.tokens as f64;
     let r = shape.ranges as f64;
     let batches = shape.tokens.div_ceil(PER_BATCH) as f64;
     match matcher {
-        Match::Table => 0.201,
-        Match::EqOr => 0.0136 + 0.0105 * k + 0.0239 * r,
-        // NOT MEASURED. The kernel is newer than the sweep, so this row is
-        // the AVX-512 row's vector terms at 2.2x: twice for the half-width
-        // lanes, and a fifth again for the compare pair AVX2 spends where
-        // `vptestmb` writes the mask word for nothing. The range slope is
-        // the measured one from the rows above. Re-run `bench::fit` on an
-        // AVX2 build and paste its block over this.
-        Match::NibbleN8K => 0.0594 + 0.0310 * batches + 0.0225 * r,
-        Match::Range => 0.0084 + 0.0225 * r,
+        Match::Table => 0.293,
+        Match::EqOr => 0.01247 + 0.00835 * k + 0.02103 * r,
+        Match::NibbleN8K => 0.04343 + 0.02745 * batches + 0.02145 * r,
+        Match::Range => 0.00643 + 0.02033 * r,
     }
 }
 
 /// Fitted on the same core and stream as [`avx2`], built for AVX-512. The
-/// mask register is what these show: a range costs half what it costs NEON
-/// and a bitmap batch half again, neither of them paying for a pack.
+/// mask register is what these show: a range costs three quarters of what it
+/// costs AVX2 and a bitmap batch two thirds, neither of them paying for a
+/// pack. Every kernel within 2.9% of its rows bar the byte table, at 6.4%.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 fn avx512bw(matcher: Match, shape: Shape) -> f64 {
     let k = shape.tokens as f64;
     let r = shape.ranges as f64;
     let batches = shape.tokens.div_ceil(PER_BATCH) as f64;
     match matcher {
-        Match::Table => 0.204,
-        Match::EqOr => 0.0079 + 0.0113 * k + 0.0127 * r,
-        Match::NibbleN8K => 0.0270 + 0.0141 * batches + 0.0119 * r,
-        Match::Range => 0.0085 + 0.0112 * r,
+        Match::Table => 0.231,
+        Match::EqOr => 0.01162 + 0.01019 * k + 0.01303 * r,
+        Match::NibbleN8K => 0.01931 + 0.01936 * batches + 0.01340 * r,
+        Match::Range => 0.00571 + 0.01475 * r,
     }
 }
 
