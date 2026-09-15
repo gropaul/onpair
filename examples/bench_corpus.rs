@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Regenerates the scan-benchmark corpora under
-//! `src/search/prefilter/scan/bench/data`.
+//! Regenerates the scan-benchmark corpora under `bench/data`.
 //!
 //!   `cargo run --release --example bench_corpus`
 //!
@@ -74,7 +73,7 @@ impl Source {
 }
 
 fn main() {
-    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/search/prefilter/scan/bench/data");
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/data");
     extract(&data);
     println!(
         "\n{:<38} {:>9} {:>10} {:>10} {:>6}",
