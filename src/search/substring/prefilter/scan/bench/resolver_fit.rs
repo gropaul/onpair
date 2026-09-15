@@ -50,10 +50,11 @@ const MERGES: &[usize] = &[1, 4, 16, 64];
 /// density of the mask it leaves behind, so two of the eight bins span it.
 const COUNTS: &[usize] = &[1, 16];
 
-/// Codes per measurement. The resolvers cost per bit and per row, so a
-/// shorter prefix than stage one's is just as steady a number, and a mask
-/// has to be built for every needle set first.
-const CODES: usize = 1 << 20;
+/// Codes per measurement, 8 MiB at two bytes a code, the working set stage
+/// one sweeps, so both stages are read against one memory ceiling. A mask is
+/// built for every needle set first, which is what this size costs. The IMDb
+/// stream is shorter than this and runs at its own length, 2.8 Mcodes.
+const CODES: usize = 1 << 22;
 
 /// One measurement of one resolver on one mask over one row layer.
 #[derive(Serialize, Deserialize)]
