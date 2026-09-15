@@ -40,7 +40,7 @@ use crate::search::substring::prefilter::ProbeCover;
 
 /// Ranges per probe. R is the axis a range's cost is expected to move with,
 /// so it is swept and everything else about a range is a control.
-const RANGE_COUNTS: &[usize] = &[1, 2, 3, 4, 6, 8];
+const RANGE_COUNTS: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16, 24, 32];
 
 /// Codes per range. A range holds its two ends in a register whatever lies
 /// between them, so this is the control on that: a width the code space
