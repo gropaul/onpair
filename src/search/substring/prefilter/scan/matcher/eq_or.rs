@@ -35,17 +35,23 @@ fn broadcast(code: Token) -> Broadcast {
     unsafe { vdupq_n_u16(code) }
 }
 
+/// Forced inline: left to the inliner, K = 1 pays a call per vector that costs
+/// more than the compare. `inline(always)` and `target_feature` exclude each
+/// other, and neon is baseline on aarch64, so the body is an unsafe block.
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
-    let (first, rest) = tokens.split_first().unwrap();
-    let mut hit = codes.map(|codes| vceqq_u16(codes, *first));
-    for token in rest {
-        for (hit, &codes) in hit.iter_mut().zip(&codes) {
-            *hit = vorrq_u16(*hit, vceqq_u16(codes, *token));
+#[inline(always)]
+fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
+    // SAFETY: neon is baseline on aarch64.
+    unsafe {
+        let (first, rest) = tokens.split_first().unwrap();
+        let mut hit = codes.map(|codes| vceqq_u16(codes, *first));
+        for token in rest {
+            for (hit, &codes) in hit.iter_mut().zip(&codes) {
+                *hit = vorrq_u16(*hit, vceqq_u16(codes, *token));
+            }
         }
+        narrow(hit)
     }
-    narrow(hit)
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]

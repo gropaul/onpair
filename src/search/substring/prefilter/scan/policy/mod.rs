@@ -64,7 +64,7 @@ pub(super) enum Match {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     Range,
     /// `ceil(K / 8)` batches of eight tokens, ORed, up to [`MAX_BATCHES`] of
-    /// them: three, and two on AVX2, which has the registers for no more.
+    /// them, which is how many the dispatch compiles.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     NibbleN8K,
 }
@@ -363,4 +363,28 @@ pub(in crate::search::substring::prefilter) fn scan_ns(
         .fold(f64::MAX, f64::min);
 
     stage_one + stage_two + covered * WALK_NS_PER_HIT
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`dispatch`](super::super::dispatch) compiles one arm per batch count
+    /// up to [`MAX_BATCHES`] and calls the rest unreachable, so the planner
+    /// must not name a kernel past it. The byte table is flat and a batch is
+    /// not, so the crossover binds long before the arms run out.
+    #[test]
+    fn the_planner_stays_inside_the_batch_arms() {
+        for tokens in 1..4096 {
+            let shape = Shape { tokens, ranges: 0 };
+            if select_matcher(shape) == Match::NibbleN8K {
+                assert!(
+                    tokens.div_ceil(PER_BATCH) <= MAX_BATCHES,
+                    "K = {tokens} wants {} batches",
+                    tokens.div_ceil(PER_BATCH)
+                );
+            }
+        }
+    }
 }

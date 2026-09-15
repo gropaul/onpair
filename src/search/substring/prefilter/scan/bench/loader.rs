@@ -16,13 +16,26 @@ pub(super) const STREAMS: &[&str] = &["ch/hits/URL_1m"];
 /// Encodings of them, each with a catalog beside it.
 pub(super) const WIDE: &[&str] = &["onpair12", "onpair16"];
 
-/// Codes per measurement. A prefix is enough for a throughput number.
-pub(super) const CODES: usize = 4 << 20;
+/// Codes per measurement, `SWEEP_CODES` overriding it. A prefix is enough for
+/// a throughput number, but it has to be one the machine reads faster than any
+/// kernel scans, or the sweep fits the memory system: an Intel server core
+/// reads 30 GB/s past its 2 MiB L2, and at the default 8 MiB every vector
+/// kernel there measures exactly that. Half a million codes, 1 MiB, stays in
+/// L2 on every machine fitted, and is the default. See `bandwidth/` in the
+/// paper repo.
+pub(super) fn codes() -> usize {
+    std::env::var("SWEEP_CODES")
+        .ok()
+        .and_then(|codes| codes.parse().ok())
+        .unwrap_or(1 << 19)
+}
 
 /// Codes each kernel's rows are checked against the cover's own over: a
 /// sixteenth of the prefix, since the check is a smoke test over real codes
 /// and bit-exactness is `matcher::tests`' job.
-pub(super) const CHECK_CODES: usize = CODES / 16;
+pub(super) fn check_codes() -> usize {
+    codes() / 16
+}
 
 /// Needle samples to measure. The three sets of a bin are interchangeable for
 /// timing, so one is enough until a bin looks noisy.

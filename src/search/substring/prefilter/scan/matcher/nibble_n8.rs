@@ -19,14 +19,11 @@ use crate::search::substring::prefilter::ProbeCover;
 /// The bits in a table byte.
 pub(in crate::search::substring::prefilter::scan) const PER_BATCH: usize = 8;
 
-#[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "x86_64", target_feature = "avx512bw")
-))]
-pub(in crate::search::substring::prefilter::scan) const MAX_BATCHES: usize = 3;
-/// Three batches of four tables plus the nibbles would spill AVX2's sixteen registers.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::prefilter::scan) const MAX_BATCHES: usize = 2;
+/// Batch counts the dispatch compiles an arm for. Not a register budget: the
+/// sweep prices a batch the same at the thirty-second as at the first, and the
+/// byte table is the cheaper kernel past about eight on every fitted set, so
+/// the planner stops well short of this.
+pub(in crate::search::substring::prefilter::scan) const MAX_BATCHES: usize = 16;
 
 /// A 16-byte shuffle row, broadcast into every 128-bit lane on x86 since
 /// `vpshufb` indexes within lanes.

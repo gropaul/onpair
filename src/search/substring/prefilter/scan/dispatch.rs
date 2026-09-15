@@ -3,9 +3,9 @@
 
 //! A plan as the two type parameters [`both_stages`] wants.
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::matcher::PER_BATCH;
 use super::matcher::{self, Matcher};
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use super::matcher::{MAX_BATCHES, PER_BATCH};
 use super::policy::{Match, Plan, Resolve};
 use super::{Check, both_stages, resolver};
 use crate::core::offset::Offset;
@@ -81,32 +81,19 @@ pub(super) fn run<O: Offset>(
             out,
         ),
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        Match::NibbleN8K => match cover.points().len().div_ceil(PER_BATCH) {
-            1 => with_skip::<O, matcher::NibbleN8<1, true>, matcher::NibbleN8<1, false>>(
-                plan,
-                cover,
-                codes,
-                row_offsets,
-                check,
-                out,
-            ),
-            2 => with_skip::<O, matcher::NibbleN8<2, true>, matcher::NibbleN8<2, false>>(
-                plan,
-                cover,
-                codes,
-                row_offsets,
-                check,
-                out,
-            ),
-            3 => with_skip::<O, matcher::NibbleN8<3, true>, matcher::NibbleN8<3, false>>(
-                plan,
-                cover,
-                codes,
-                row_offsets,
-                check,
-                out,
-            ),
-            _ => unreachable!("the planner caps the batches at MAX_BATCHES"),
-        },
+        Match::NibbleN8K => {
+            macro_rules! at {
+                ($($n:literal)*) => {
+                    match cover.points().len().div_ceil(PER_BATCH) {
+                        $($n => with_skip::<O, matcher::NibbleN8<$n, true>, matcher::NibbleN8<$n, false>>(
+                            plan, cover, codes, row_offsets, check, out,
+                        ),)*
+                        _ => unreachable!("`takes` admits at most MAX_BATCHES batches"),
+                    }
+                };
+            }
+            const _: () = assert!(MAX_BATCHES == 16, "one arm below per batch count");
+            at!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16)
+        }
     }
 }

@@ -29,7 +29,8 @@ use super::super::matcher::{NibbleN8, PER_BATCH};
 use super::super::policy::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
 use super::super::{BLOCK, Check, Isa, both_stages, resolver};
 use super::loader::{
-    CHECK_CODES, CODES, NeedleSet, SAMPLE, STREAMS, WIDE, code, load_corpus, load_needles, paths,
+    NeedleSet, SAMPLE, STREAMS, WIDE, check_codes, code, codes as sweep_codes, load_corpus,
+    load_needles, paths,
     row_layer,
 };
 use super::utils::{error, file_name, line, read_csv, slope, write_csv};
@@ -217,10 +218,19 @@ fn run<M: Matcher>(
     checked: &[Token],
     check_rows: &[u32],
 ) -> Option<(f64, Vec<usize>)> {
-    let cover = probe.cover();
-    if !takes(kind, Shape::of(&cover)) {
+    if !takes(kind, Shape::of(&probe.cover())) {
         return None;
     }
+    time::<M>(probe, codes, checked, check_rows)
+}
+
+fn time<M: Matcher>(
+    probe: &Probe<'_>,
+    codes: &[Token],
+    checked: &[Token],
+    check_rows: &[u32],
+) -> Option<(f64, Vec<usize>)> {
+    let cover = probe.cover();
     let matcher = M::new(&cover);
     let mut bits = [0u64; BLOCK / 64];
     let seconds = best(&mut || mask_stream(&matcher, codes, &mut bits));
@@ -236,7 +246,8 @@ fn run<M: Matcher>(
 }
 
 /// `NibbleN8` at the batch count K needs, `ceil(K / 8)`, so one row
-/// shows what a kernel that sizes itself to the cover would run at.
+/// shows what a kernel that sizes itself to the cover would run at, at
+/// every K the catalog has.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn nibble_n8k<const SKIP: bool>(name: &'static str) -> Kernel {
     fn run_8k<const SKIP: bool>(
@@ -246,12 +257,26 @@ fn nibble_n8k<const SKIP: bool>(name: &'static str) -> Kernel {
         checked: &[Token],
         check_rows: &[u32],
     ) -> Option<(f64, Vec<usize>)> {
-        match probe.cover().points().len().div_ceil(PER_BATCH) {
-            1 => run::<NibbleN8<1, SKIP>>(kind, probe, codes, checked, check_rows),
-            2 => run::<NibbleN8<2, SKIP>>(kind, probe, codes, checked, check_rows),
-            3 => run::<NibbleN8<3, SKIP>>(kind, probe, codes, checked, check_rows),
-            _ => None,
+        let shape = Shape::of(&probe.cover());
+        // Asked at one batch, so the answer is the instruction set and
+        // `tokens > 0`, not the cap.
+        let one = Shape {
+            tokens: shape.tokens.min(PER_BATCH),
+            ..shape
+        };
+        if !takes(kind, one) {
+            return None;
         }
+        macro_rules! at {
+            ($($n:literal)*) => {
+                match shape.tokens.div_ceil(PER_BATCH) {
+                    $($n => time::<NibbleN8<$n, SKIP>>(probe, codes, checked, check_rows),)*
+                    _ => None,
+                }
+            };
+        }
+        at!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+            17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
     }
     Kernel {
         name,
@@ -281,7 +306,7 @@ fn kernels() -> Vec<Kernel> {
 fn measure(stream: &str, encoding: &str, kernels: &[Kernel], machine: &str, out: &mut Vec<Row>) {
     let (corpus_path, needles_path) = paths(stream, encoding);
     let corpus = load_corpus(&corpus_path);
-    let codes = &corpus.codes[..CODES.min(corpus.codes.len())];
+    let codes = &corpus.codes[..sweep_codes().min(corpus.codes.len())];
     // The row layer, cut to the codes being scanned and closed over the
     // row the cut fell inside: a bit set for the last code needs a row,
     // and a range sets one for every code.
@@ -298,7 +323,7 @@ fn measure(stream: &str, encoding: &str, kernels: &[Kernel], machine: &str, out:
         probes.len(),
         sets.len()
     );
-    let checked = &codes[..CHECK_CODES.min(codes.len())];
+    let checked = &codes[..check_codes().min(codes.len())];
     let check_rows = row_layer(&corpus.row_offsets, checked.len());
     for probe in &probes {
         // Untimed, and the reason the catalog is loaded rather than

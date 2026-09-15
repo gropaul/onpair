@@ -61,6 +61,7 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 }
 
 /// No unsigned u16 compare below AVX-512: `min(x, width) == x` is `x <= width`.
+#[inline]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
 pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
