@@ -63,9 +63,9 @@ impl ProbeCover {
         Self { points, ranges }
     }
 
-    /// Whether the cover names `code`. The test oracles ask; the kernels
-    /// never do, they probe the whole vector.
-    #[cfg(test)]
+    /// Whether the cover names `code`. The test oracles and
+    /// [`prefilter_hits`](super::prefilter_hits) ask; the kernels never do,
+    /// they probe the whole vector.
     pub fn contains(&self, code: Token) -> bool {
         self.points.contains(&code) || self.ranges.iter().any(|range| range.contains(code))
     }

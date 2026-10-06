@@ -12,7 +12,8 @@ use super::mincut::min_cut;
 use super::plan::{cheapest_cover, cover_frequency};
 use super::scan::{Region, scan_ns};
 use super::{
-    analyze_prefilter, prefilter_candidates, prefilter_is_likely_profitable, prefilter_superset,
+    analyze_prefilter, prefilter_candidates, prefilter_hits, prefilter_is_likely_profitable,
+    prefilter_superset, prefilter_walk_hits,
 };
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -481,6 +482,55 @@ fn superset_verified_by_memmem_matches_the_walk() {
         );
         BytesVerifier::new(needle).retain(view, &mut superset);
         assert_eq!(superset, exact, "verifiers disagree on {needle:?}");
+    }
+}
+
+#[test]
+fn walk_over_located_hits_matches_the_fused_walk() {
+    use crate::test_corpus::user_strings;
+    let corpus: Vec<Vec<u8>> = user_strings(50)
+        .into_iter()
+        .flat_map(|s| std::iter::repeat_n(s.into_bytes(), 4))
+        .collect();
+    let refs: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    let col = compress_rows(&refs);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    for needle in [&b"a"[..], b"user", b"ing", b"e_", b"zzz", b""] {
+        let analysis = analyze_prefilter(needle, view.dict, &frequencies, view.num_rows());
+        let mut exact = Vec::new();
+        prefilter_candidates(
+            view.codes,
+            view.row_offsets,
+            view.dict,
+            &analysis,
+            &mut exact,
+        );
+        let mut superset = Vec::new();
+        prefilter_superset(view.codes, view.row_offsets, &analysis, &mut superset);
+        let mut hits = Vec::new();
+        prefilter_hits(
+            view.codes,
+            view.row_offsets,
+            &analysis,
+            &superset,
+            &mut hits,
+        );
+        assert!(
+            hits.windows(2)
+                .all(|w| w[0].row <= w[1].row && w[0].code < w[1].code),
+            "hits are not ascending for {needle:?}"
+        );
+        let mut walked = Vec::new();
+        prefilter_walk_hits(
+            view.codes,
+            view.row_offsets,
+            view.dict,
+            &analysis,
+            &hits,
+            &mut walked,
+        );
+        assert_eq!(walked, exact, "the split walk disagrees on {needle:?}");
     }
 }
 

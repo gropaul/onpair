@@ -27,8 +27,8 @@ pub(in crate::search::substring::prefilter) use policy::{Facts, Region, scan_ns}
 use resolver::Resolver;
 pub(in crate::search::substring::prefilter) use walk::Walk;
 
-use super::PrefilterAnalysis;
 use super::cover::ProbeCover;
+use super::{PrefilterAnalysis, PrefilterHit};
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
@@ -145,6 +145,41 @@ pub(super) fn execute<O: Offset>(
 ) {
     let codes = input.codes;
     execute_check(plan, input, Check::Walk { walk, dict, codes }, out);
+}
+
+
+/// The walk alone, over hits located beforehand: what
+/// [`prefilter_walk_hits`](super::prefilter_walk_hits) runs. A row is emitted
+/// at its first passing hit and its remaining hits are skipped rather than
+/// walked, which is what the resolver does with the rest of a row's mask.
+pub(super) fn walk_hits<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    walk: &Walk,
+    dict: CompactDictionaryView<'_>,
+    hits: &[PrefilterHit],
+    out: &mut Vec<usize>,
+) {
+    let mut i = 0;
+    while i < hits.len() {
+        let row = hits[i].row;
+        let start = row_offsets[row].to_usize();
+        let end = row_offsets[row + 1].to_usize();
+        let mut passed = false;
+        while i < hits.len() && hits[i].row == row {
+            if walk.check(dict, codes, start, end, hits[i].code) {
+                passed = true;
+                break;
+            }
+            i += 1;
+        }
+        if passed {
+            out.push(row);
+            while i < hits.len() && hits[i].row == row {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// The plan under whatever stage two asks of a hit.

@@ -290,6 +290,78 @@ pub fn prefilter_superset<O: Offset>(
     scan::execute_superset(plan, input, out);
 }
 
+/// A covered token occurrence: the row it falls in, and its index in the code
+/// stream. What the scan kernels hand the walk, recorded so the walk can be
+/// timed without them. See [`prefilter_hits`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PrefilterHit {
+    /// The row the occurrence falls in.
+    pub row: usize,
+    /// Its index in `codes`.
+    pub code: usize,
+}
+
+/// Append every covered token occurrence inside `rows`, ascending.
+///
+/// `rows` are the candidate rows [`prefilter_superset`] admitted. This locates
+/// scalar-wise what the kernels locate, so that [`prefilter_walk_hits`] can be
+/// measured with nothing in front of it; the executing paths never call it.
+///
+/// # Precondition
+/// As [`prefilter_superset`], and every entry of `rows` is a valid row index.
+pub fn prefilter_hits<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    analysis: &PrefilterAnalysis,
+    rows: &[usize],
+    out: &mut Vec<PrefilterHit>,
+) {
+    if analysis.matches_all {
+        return;
+    }
+    let cover = analysis.probe_cover();
+    for &row in rows {
+        let start = row_offsets[row].to_usize();
+        let end = row_offsets[row + 1].to_usize();
+        out.extend(
+            (start..end)
+                .filter(|&code| cover.contains(codes[code]))
+                .map(|code| PrefilterHit { row, code }),
+        );
+    }
+}
+
+/// Walk `hits` and append the rows the pattern occurs in, ascending.
+///
+/// The exact half of [`prefilter_candidates`] with the scan taken out: given
+/// the hits the kernels would have produced, this performs the same alignment
+/// walks in the same order, stopping at a row's first passing hit as the
+/// resolver does. Over the hits of [`prefilter_superset`]'s rows it returns
+/// [`prefilter_candidates`]'s rows exactly.
+///
+/// This exists to price the walk per candidate row against the verifiers it
+/// replaces, which are themselves timed over a candidate list. It is slower
+/// than the fused path it measures, which walks a hit the kernel has just
+/// produced, and is not a faster way to answer the query.
+///
+/// # Precondition
+/// `hits` is ascending by row, as [`prefilter_hits`] produces it, and the
+/// preconditions of [`prefilter_candidates`] hold.
+pub fn prefilter_walk_hits<O: Offset>(
+    codes: &[Token],
+    row_offsets: &[O],
+    dict: CompactDictionaryView<'_>,
+    analysis: &PrefilterAnalysis,
+    hits: &[PrefilterHit],
+    out: &mut Vec<usize>,
+) {
+    if analysis.matches_all {
+        out.extend(0..row_offsets.len().saturating_sub(1));
+        return;
+    }
+    scan::walk_hits(codes, row_offsets, &analysis.walk, dict, hits, out);
+}
+
 /// The longest pattern [`analyze_prefilter`] takes: one node per needle offset
 /// plus the sink, all of them inside the walk's `u16` ids.
 pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;
