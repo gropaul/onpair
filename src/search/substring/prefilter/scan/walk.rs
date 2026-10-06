@@ -136,17 +136,11 @@ impl EdgesByToken {
         edges
     }
 
+    /// The table entry of `token`: its one edge, or a sentinel.
     #[inline]
-    fn of(&self, token: Token) -> impl Iterator<Item = Edge> + '_ {
+    fn entry(&self, token: Token) -> Edge {
         let at = usize::from(token.wrapping_sub(self.first_token));
-        let (single, listed) = match self.edge_of_token.get(at).copied().unwrap_or(NONE) {
-            NONE => (None, &self.edges_of_tokens[..0]),
-            LISTED => (None, self.listed_for(token)),
-            edge => (Some(edge), &self.edges_of_tokens[..0]),
-        };
-        single
-            .into_iter()
-            .chain(listed.iter().map(|&(_, edge)| edge))
+        self.edge_of_token.get(at).copied().unwrap_or(NONE)
     }
 
     fn listed_for(&self, token: Token) -> &[(Token, Edge)] {
@@ -226,15 +220,20 @@ impl Walk {
         hit_code_index: usize,
     ) -> bool {
         let hit = codes[hit_code_index];
-        for edge in self.edges.of(hit) {
+        let passes = |edge: Edge| {
             let (from, to) = (u32::from(edge.from), u32::from(edge.to));
-            if (to == self.sink() || self.forward(to, hit_code_index + 1, codes, row_end))
+            (to == self.sink() || self.forward(to, hit_code_index + 1, codes, row_end))
                 && self.backward(from, hit_code_index, codes, row_start, dict)
-            {
-                return true;
-            }
+        };
+        match self.edges.entry(hit) {
+            NONE => false,
+            LISTED => self
+                .edges
+                .listed_for(hit)
+                .iter()
+                .any(|&(_, edge)| passes(edge)),
+            edge => passes(edge),
         }
-        false
     }
 
     /// The greedy path from `node`, reading `codes[code_index..row_end]`,
@@ -283,7 +282,17 @@ impl Walk {
                 return false;
             }
             let code = codes[code_end - 1];
-            let step = self.edges.of(code).find(|edge| u32::from(edge.to) == node);
+            let step = match self.edges.entry(code) {
+                NONE => None,
+                LISTED => self
+                    .edges
+                    .listed_for(code)
+                    .iter()
+                    .map(|&(_, edge)| edge)
+                    .find(|edge| u32::from(edge.to) == node),
+                edge if u32::from(edge.to) == node => Some(edge),
+                _ => None,
+            };
             let Some(step) = step else {
                 // Only an occurrence beginning inside `code` is left, decided
                 // off the dictionary where the planner never enumerated the
