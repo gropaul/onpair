@@ -28,9 +28,28 @@ pub(in crate::search::substring::prefilter::scan) fn available() -> bool {
     return true;
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
     return std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512bw",
+        not(target_feature = "avx512vbmi")
+    ))]
     return std::arch::is_x86_feature_detected!("avx512bw");
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+    return std::arch::is_x86_feature_detected!("avx512vbmi");
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512vbmi"))]
+/// `vpermt2b` indices of the low byte of every u16 lane of two vectors, in
+/// code order; one more picks the high bytes.
+pub(super) const EVEN: [u8; 64] = {
+    let mut even = [0u8; 64];
+    let mut at = 0;
+    while at < 64 {
+        even[at] = 2 * at as u8;
+        at += 1;
+    }
+    even
+};
 
 /// The 64 codes of one mask word.
 #[cfg(target_arch = "aarch64")]

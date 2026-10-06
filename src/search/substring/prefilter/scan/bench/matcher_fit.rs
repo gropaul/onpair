@@ -248,6 +248,30 @@ fn time<M: Matcher>(
 /// shows what a kernel that sizes itself to the cover would run at, at
 /// every K the catalog has.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+/// Outside the planner, so `takes` is not asked: any cover inside the 4096
+/// codes the bitmap holds.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn bitmap12<const SKIP: bool>(name: &'static str) -> Kernel {
+    fn run_12<const SKIP: bool>(
+        _: Match,
+        probe: &Probe<'_>,
+        codes: &[Token],
+        checked: &[Token],
+        check_rows: &[u32],
+    ) -> Option<(f64, Vec<usize>)> {
+        let cover = probe.cover();
+        if cover.is_empty() || !super::super::matcher::fits_bitmap12(&cover) {
+            return None;
+        }
+        time::<super::super::matcher::Bitmap12<SKIP>>(probe, codes, checked, check_rows)
+    }
+    Kernel {
+        name,
+        kind: Match::Table,
+        run: run_12::<SKIP>,
+    }
+}
+
 fn nibble_n8k<const SKIP: bool>(name: &'static str) -> Kernel {
     fn run_8k<const SKIP: bool>(
         kind: Match,
@@ -295,6 +319,11 @@ fn kernels() -> Vec<Kernel> {
         kernel::<Range<true>>(Match::Range, "range_skip"),
         nibble_n8k::<false>("nibble_n8k"),
         nibble_n8k::<true>("nibble_n8k_skip"),
+    ]);
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+    all.extend([
+        bitmap12::<false>("bitmap12"),
+        bitmap12::<true>("bitmap12_skip"),
     ]);
     all
 }
