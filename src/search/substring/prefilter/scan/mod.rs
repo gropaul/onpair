@@ -220,7 +220,7 @@ pub(super) fn scan_scalar<O: Offset>(
 }
 
 /// Codes per block, 64 words of mask. Kernels rely on the multiple of 64.
-pub(in crate::search::substring::prefilter) const BLOCK: usize = 4096;
+pub(in crate::search::substring::prefilter) const BLOCK: usize = 512;
 
 /// The instruction set this build's kernels run on. The other thing a cost
 /// is per: the same kernel is a different cost on each, since what a range

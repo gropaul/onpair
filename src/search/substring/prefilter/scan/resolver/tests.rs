@@ -127,7 +127,7 @@ fn agree_on_every_density() {
             &vec![u64::MAX; CODES / 64],
             &row_offsets,
         );
-        for stride in [1, 2, 7, 64, 97, 4096, 5000] {
+        for stride in [1, 2, 7, 64, 97, BLOCK, 5 * BLOCK / 4] {
             every_resolver(
                 &format!("{name}, every {stride}th code"),
                 &strided(stride),
@@ -141,11 +141,11 @@ fn agree_on_every_density() {
 /// row, on either side of a block boundary.
 #[test]
 fn agree_on_a_row_hit_in_two_blocks() {
-    let row_offsets = vec![0, 100, (BLOCK + 2000) as u32, CODES as u32];
+    let row_offsets = vec![0, (BLOCK / 4) as u32, (BLOCK + BLOCK / 2) as u32, CODES as u32];
     for pair in [
         [BLOCK - 1, BLOCK],
-        [BLOCK - 1, BLOCK + 1999],
-        [150, BLOCK + 1999],
+        [BLOCK - 1, BLOCK + BLOCK / 2 - 1],
+        [BLOCK / 4 + BLOCK / 8, BLOCK + BLOCK / 2 - 1],
     ] {
         let mut mask = empty_mask();
         for code in pair {
@@ -178,7 +178,7 @@ fn agree_on_the_ends_of_the_stream() {
 #[test]
 fn agree_on_one_hit_after_many_rows() {
     let row_offsets = uniform(3);
-    for code in [1, 2, 3, 4, 8, 4095, 4096, 4097, CODES - 2] {
+    for code in [1, 2, 3, 4, 8, BLOCK - 1, BLOCK, BLOCK + 1, CODES - 2] {
         let mut mask = empty_mask();
         mask[code / 64] |= 1 << (code % 64);
         let rows = expected(&mask, &row_offsets);

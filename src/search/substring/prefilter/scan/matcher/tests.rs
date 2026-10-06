@@ -131,7 +131,7 @@ fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) 
 fn agree_on_needles_the_block_holds() {
     let codes = block();
     for count in [1, 2, 3, 8, 9, 12, 16, 17, 24, 64] {
-        let needles: Vec<Token> = (0..count).map(|k| codes[k * 37]).collect();
+        let needles: Vec<Token> = (0..count).map(|k| codes[k * (BLOCK / 64)]).collect();
         let cover = ProbeCover::new(needles.to_vec(), vec![]);
         assert_eq!(
             expected(&cover, &codes)
@@ -173,11 +173,12 @@ fn agree_on_a_hit_at_the_seam() {
 #[test]
 fn agree_on_codes_sharing_a_low_byte() {
     let mut codes = [0x0102 as Token; BLOCK];
-    codes[70] = 0x0202;
+    let at = BLOCK - 58;
+    codes[at] = 0x0202;
     let cover = ProbeCover::new(vec![0x0202], vec![]);
     assert_eq!(
-        expected(&cover, &codes)[1],
-        1 << 6,
+        expected(&cover, &codes)[at / 64],
+        1 << (at % 64),
         "the definition missed the planted code"
     );
     // A range whose codes share the low byte of every code in the block but
@@ -338,8 +339,9 @@ fn table_rejects_the_codes_around_its_own() {
 #[test]
 fn the_table_masks_one_code() {
     let codes = block();
-    let bits = mask::<Table>(&ProbeCover::new(codes[100..101].to_vec(), vec![]), &codes);
-    assert_eq!(bits[100 / 64] >> (100 % 64) & 1, 1, "missed the code");
+    let at = BLOCK - 28;
+    let bits = mask::<Table>(&ProbeCover::new(codes[at..at + 1].to_vec(), vec![]), &codes);
+    assert_eq!(bits[at / 64] >> (at % 64) & 1, 1, "missed the code");
     assert_eq!(
         bits.iter().map(|word| word.count_ones()).sum::<u32>(),
         1,
