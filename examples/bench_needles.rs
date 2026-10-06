@@ -24,8 +24,9 @@ use hashbrown::HashMap;
 /// Needle lengths, in codes.
 const LENGTHS: &[usize] = &[1, 2, 4];
 /// Needles OR-ed together in one query.
-const COUNTS: &[usize] =
-    &[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256];
+const COUNTS: &[usize] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256,
+];
 /// Target share of rows a set should match.
 const TARGETS: &[f64] = &[0.0, 0.001, 0.01, 0.1, 0.2, 0.5];
 /// Sets per bin.

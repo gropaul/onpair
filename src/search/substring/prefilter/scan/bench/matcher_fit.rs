@@ -30,8 +30,7 @@ use super::super::policy::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
 use super::super::{BLOCK, Check, Isa, both_stages, resolver};
 use super::loader::{
     NeedleSet, SAMPLE, STREAMS, WIDE, check_codes, code, codes as sweep_codes, load_corpus,
-    load_needles, paths,
-    row_layer,
+    load_needles, paths, row_layer,
 };
 use super::utils::{error, file_name, line, read_csv, slope, write_csv};
 use super::{best, isa_cfg, isa_name, isa_named, machine, mask_stream};
