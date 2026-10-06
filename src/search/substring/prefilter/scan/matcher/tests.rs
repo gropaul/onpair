@@ -3,8 +3,6 @@
 
 //! Every matcher against `ProbeCover::contains`.
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
-use super::{Bitmap12, fits_bitmap12};
 use super::{Block, Mask, Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{EqOr, Range};
@@ -89,11 +87,6 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
             }
             _ => {}
         }
-    }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
-    if !cover.is_empty() && fits_bitmap12(cover) {
-        agrees::<Bitmap12<false>>(Match::Table, "bitmap12", cover, codes);
-        agrees::<Bitmap12<true>>(Match::Table, "bitmap12_skip_empty", cover, codes);
     }
 }
 

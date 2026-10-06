@@ -3,8 +3,6 @@
 
 //! Stage one: codes in, bit mask out.
 
-#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512vbmi"))]
-mod bitmap12;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod eq_or;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -20,8 +18,6 @@ mod tests;
 use super::{Block, Mask};
 use crate::search::substring::prefilter::ProbeCover;
 
-#[cfg(all(test, target_arch = "x86_64", target_feature = "avx512vbmi"))]
-pub(in crate::search::substring::prefilter::scan) use bitmap12::{Bitmap12, fits as fits_bitmap12};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(in crate::search::substring::prefilter::scan) use eq_or::EqOr;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
