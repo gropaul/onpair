@@ -40,13 +40,31 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
     }
 }
 
+/// Forced inline: left to the inliner, the compare and nibble kernels put the
+/// eight code vectors through the stack once per range, 3.5x what a range
+/// costs here. `inline(always)` and `target_feature` exclude each other, and
+/// neon is baseline on aarch64. `array::map` is spelled out for the same
+/// reason, it lowering to an out-of-line `drain_array_with`.
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
+#[inline(always)]
 pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
     (lo, width): Held,
     codes: Vectors,
 ) -> Hits {
-    narrow(codes.map(|codes| vcleq_u16(vsubq_u16(codes, lo), width)))
+    // SAFETY: neon is baseline on aarch64.
+    unsafe {
+        let at = |codes| vcleq_u16(vsubq_u16(codes, lo), width);
+        narrow([
+            at(codes[0]),
+            at(codes[1]),
+            at(codes[2]),
+            at(codes[3]),
+            at(codes[4]),
+            at(codes[5]),
+            at(codes[6]),
+            at(codes[7]),
+        ])
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]

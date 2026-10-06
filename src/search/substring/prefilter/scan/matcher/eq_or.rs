@@ -40,7 +40,7 @@ fn broadcast(code: Token) -> Broadcast {
 /// other, and neon is baseline on aarch64, so the body is an unsafe block.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
+unsafe fn hits(tokens: &[Broadcast], codes: Vectors) -> Hits {
     // SAFETY: neon is baseline on aarch64.
     unsafe {
         let (first, rest) = tokens.split_first().unwrap();
@@ -118,6 +118,9 @@ impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for EqOr<SKIP_MOVEMASK_IF_NO
 }
 
 /// Outside `check` so the closure inherits the target features and inlines.
+/// A cover with no ranges gets its own closure: sharing one with the ranged
+/// path costs the compare kernel 0.025 ns per code at K = 1, the register
+/// pressure of a range loop it never enters.
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
 fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
@@ -126,6 +129,11 @@ fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
     codes: &Block,
     bits: &mut Mask,
 ) -> bool {
+    if ranges.is_empty() {
+        return words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
+            hits(tokens, codes)
+        });
+    }
     words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
         check_ranges(hits(tokens, codes), ranges, codes)
     })

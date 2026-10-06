@@ -207,19 +207,22 @@ pub(super) fn ns_per_code(matcher: Match, shape: Shape) -> f64 {
     }
 }
 
-/// Fitted on `ch/hits/URL_1m` on an Apple M4 Pro, 2026-09-15, over 4 Mcodes,
-/// every kernel within 2.3% of its rows. That core reads 99.5 GB/s at this
-/// size, so nothing under 0.02011 ns per code was reachable.
+/// Fitted on `ch/hits/URL_1m` on an Apple M4 Pro, 2026-09-20, over 4 Mcodes,
+/// every kernel within 3.9% of its rows. That core reads 114.3 GB/s at this
+/// size, so nothing under 0.01749 ns per code was reachable. A range now costs
+/// the same in all three kernels, `range::inside` having been forced inline:
+/// the 0.0497 and 0.0650 the 2026-09-15 fit charged the vector kernels were a
+/// stack round trip per range, not a range.
 #[cfg(target_arch = "aarch64")]
 fn neon(matcher: Match, shape: Shape) -> f64 {
     let k = shape.tokens as f64;
     let r = shape.ranges as f64;
     let batches = shape.tokens.div_ceil(PER_BATCH) as f64;
     match matcher {
-        Match::Table => 0.184,
-        Match::EqOr => 0.00588 + 0.01380 * k + 0.04966 * r,
-        Match::NibbleN8K => 0.02325 + 0.03061 * batches + 0.06501 * r,
-        Match::Range => 0.00330 + 0.02103 * r,
+        Match::Table => 0.189,
+        Match::EqOr => 0.00433 + 0.01414 * k + 0.02153 * r,
+        Match::NibbleN8K => 0.02178 + 0.03216 * batches + 0.02211 * r,
+        Match::Range => 0.00350 + 0.02127 * r,
     }
 }
 
