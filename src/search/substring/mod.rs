@@ -16,8 +16,8 @@ mod verify;
 
 pub use contains::{ContainsTable, contains};
 pub use prefilter::{
-    MAX_PATTERN_LEN, PrefilterAnalysis, PrefilterHit, ProbeCover, analyze_prefilter,
-    prefilter_candidates, prefilter_hits, prefilter_is_likely_profitable, prefilter_superset,
-    prefilter_walk_hits,
+    MAX_PATTERN_LEN, PrefilterAnalysis, PrefilterHit, PrefilterTrace, ProbeCover, TraceEdge,
+    TraceLabel, analyze_prefilter, prefilter_candidates, prefilter_hits,
+    prefilter_is_likely_profitable, prefilter_superset, prefilter_walk_hits, trace_prefilter,
 };
 pub use verify::BytesVerifier;

@@ -47,7 +47,7 @@ pub(super) fn plan(
         code_count: frequencies.total_frequency() as usize,
         row_count,
     };
-    let (cover, covered, scan_ns) = cheapest_cover(&graph, frequencies, region);
+    let (cover, covered, scan_ns, _) = cheapest_cover(&graph, frequencies, region);
 
     Planned {
         cover,
@@ -57,8 +57,8 @@ pub(super) fn plan(
     }
 }
 
-/// The cut whose cover [`scan_ns`] prices lowest, with what it covers and
-/// costs.
+/// The cut whose cover [`scan_ns`] prices lowest, with what it covers, what
+/// it costs and the ids of its edges.
 ///
 /// λ trades a cut's frequency against its comparisons, and the cut it selects
 /// is piecewise constant in λ: it changes only where two cuts swap places, and
@@ -70,7 +70,7 @@ pub(super) fn cheapest_cover(
     graph: &AlignmentGraph,
     frequencies: TokenFrequencyIndexView<'_>,
     region: Region,
-) -> (ProbeCover, u32, f64) {
+) -> (ProbeCover, u32, f64, Vec<u32>) {
     let ceiling = u64::from(frequencies.total_frequency());
     let by = |lambda: u64| {
         move |edge: &Edge| {
@@ -79,14 +79,14 @@ pub(super) fn cheapest_cover(
         }
     };
     let mut solver = MinCut::new(&graph.edges, graph.nodes);
-    let mut best: Option<(ProbeCover, u32, f64)> = None;
-    let price = |cut: &[u32], best: &mut Option<(ProbeCover, u32, f64)>| {
+    let mut best: Option<(ProbeCover, u32, f64, Vec<u32>)> = None;
+    let price = |cut: &[u32], best: &mut Option<(ProbeCover, u32, f64, Vec<u32>)>| {
         let edges: Vec<&Edge> = cut.iter().map(|&at| &graph.edges[at as usize]).collect();
         let cover = ProbeCover::from_edge_cut(&edges);
         let covered = cover_frequency(&cover, frequencies);
         let ns = scan_ns(&cover, covered, region);
-        if best.as_ref().is_none_or(|(_, _, best_ns)| ns < *best_ns) {
-            *best = Some((cover, covered, ns));
+        if best.as_ref().is_none_or(|(_, _, best_ns, _)| ns < *best_ns) {
+            *best = Some((cover, covered, ns, cut.to_vec()));
         }
     };
 

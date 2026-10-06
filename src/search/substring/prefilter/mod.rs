@@ -52,11 +52,13 @@ mod graph;
 mod mincut;
 mod plan;
 mod scan;
+mod trace;
 
 #[cfg(test)]
 mod tests;
 
 pub use cover::ProbeCover;
+pub use trace::{PrefilterTrace, TraceEdge, TraceLabel, trace_prefilter};
 
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;

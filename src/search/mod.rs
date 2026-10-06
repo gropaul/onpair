@@ -59,8 +59,9 @@ pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
 pub use substring::{
-    BytesVerifier, ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, PrefilterHit, ProbeCover,
-    analyze_prefilter, contains, prefilter_candidates, prefilter_hits,
-    prefilter_is_likely_profitable, prefilter_superset, prefilter_walk_hits,
+    BytesVerifier, ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, PrefilterHit, PrefilterTrace,
+    ProbeCover, TraceEdge, TraceLabel, analyze_prefilter, contains, prefilter_candidates,
+    prefilter_hits, prefilter_is_likely_profitable, prefilter_superset, prefilter_walk_hits,
+    trace_prefilter,
 };
 pub use tokenize::tokenize;

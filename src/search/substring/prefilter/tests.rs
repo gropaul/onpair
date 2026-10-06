@@ -883,7 +883,7 @@ fn sweep_prices_at_or_below_the_frequency_cut() {
         let baseline = ProbeCover::from_edge_cut(&by_frequency);
         let baseline_ns = scan_ns(&baseline, cover_frequency(&baseline, freq), region);
 
-        let (cover, covered, ns) = cheapest_cover(&graph, freq, region);
+        let (cover, covered, ns, _) = cheapest_cover(&graph, freq, region);
         assert_eq!(covered, cover_frequency(&cover, freq));
         assert_eq!(ns, scan_ns(&cover, covered, region));
         assert!(
