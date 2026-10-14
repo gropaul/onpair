@@ -3,11 +3,12 @@
 
 //! Regenerates the scan-benchmark corpora under `bench/data`.
 //!
-//!   `cargo run --release --example bench_corpus`
+//!   `cargo run --release --example bench_corpus [db...]`
 //!
 //! Pulls one string column at a time out of the DuckDB files in `$HOME` (the
 //! `duckdb` CLI has to be on `PATH`), then re-encodes each corpus as two
-//! OnPair streams. Layout is
+//! OnPair streams. Naming databases (`ch`, `imdb`, `stackoverflow`) restricts
+//! the run to their columns; the default is every source. Layout is
 //! `<database>/<table>/<column>_<size>[.<encoding>].csv`, one row per line:
 //! a raw file holds the value, an encoded file holds that row's codes as
 //! comma-separated decimals, so the row layer survives as the line structure.
@@ -74,12 +75,18 @@ impl Source {
 
 fn main() {
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/data");
-    extract(&data);
+    let dbs: Vec<String> = std::env::args().skip(1).collect();
+    let sources: Vec<&Source> = SOURCES
+        .iter()
+        .filter(|s| dbs.is_empty() || dbs.iter().any(|db| db == s.db))
+        .collect();
+    assert!(!sources.is_empty(), "no source in {dbs:?}");
+    extract(&data, &sources);
     println!(
         "\n{:<38} {:>9} {:>10} {:>10} {:>6}",
         "file", "rows", "raw MB", "codes", "ratio"
     );
-    for source in SOURCES {
+    for source in &sources {
         for (size, _) in SIZES {
             encode(&source.raw_path(&data, size), &data);
         }
@@ -90,10 +97,10 @@ fn main() {
 /// dropped, and a newline inside a value becomes a space: either way the value
 /// would not survive one row per line. Only `Users.AboutMe` is much affected,
 /// where 78% of the values run over several lines.
-fn extract(data: &Path) {
+fn extract(data: &Path, sources: &[&Source]) {
     let mut sql = String::new();
     let mut attached: Vec<&str> = Vec::new();
-    for source in SOURCES {
+    for source in sources {
         if !attached.contains(&source.db) {
             attached.push(source.db);
             let db = source.db;
@@ -104,7 +111,7 @@ fn extract(data: &Path) {
         "CREATE OR REPLACE MACRO flatten(s) AS \
          replace(replace(s, chr(10), ' '), chr(13), ' ');\n",
     );
-    for source in SOURCES {
+    for source in sources {
         let (db, table, column) = (source.db, source.table, source.column);
         writeln!(
             sql,
