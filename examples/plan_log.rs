@@ -22,7 +22,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use onpair::search::index::build_token_frequency_index;
-use onpair::search::{TraceLabel, prefilter_superset, trace_prefilter};
+use onpair::search::{Finder, TraceLabel, Verify, trace_prefilter};
 use onpair::{Column, Config, DictionaryView, MaxDictBits, PruneFactor, Threshold};
 
 fn u64_at(bytes: &[u8], at: &mut usize) -> u64 {
@@ -212,7 +212,7 @@ fn main() {
 
             let trace = trace_prefilter(needle, view.dict, &freq, rows);
             let mut admitted = Vec::new();
-            prefilter_superset(view.codes, view.row_offsets, &trace.analysis, &mut admitted);
+            Finder::new().find(view, &trace.analysis, Verify::Superset, None, &mut admitted);
             let mut at = admitted.iter().peekable();
             let sound = matching.iter().all(|row| {
                 while at.next_if(|&&a| a < *row).is_some() {}

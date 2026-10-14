@@ -59,6 +59,21 @@ use crate::search::index::TokenFrequencyIndexView;
 use crate::search::lookup::narrow;
 use crate::search::prefix_range;
 
+/// Where an occurrence must sit in its row. A prefix begins at the row's first
+/// byte, so its one layout is the greedy chain from offset 0. A suffix ends at
+/// the row's last byte, where the encoder's parse stops with the needle: no
+/// terminal range, the last greedy step enters the sink, and a token holding
+/// the whole needle must end with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// A substring, anywhere in the row.
+    Anywhere,
+    /// A prefix, from the row's first byte.
+    Start,
+    /// A suffix, to the row's last byte.
+    End,
+}
+
 /// Largest first-token set still worth enumerating as an explicit probe.
 pub(super) const PROBE_SET_SIZE_LIMIT: usize = 512;
 
@@ -239,7 +254,9 @@ fn greedy_in_needle(dict: CompactDictionaryView<'_>, suffix: &[u8]) -> Option<(T
 struct Builder<'d, 'n, 'f> {
     dict: CompactDictionaryView<'d>,
     needle: &'n [u8],
-    frequencies: TokenFrequencyIndexView<'f>,
+    anchor: Anchor,
+    /// None for a graph only walked, never cut: its probes weigh nothing.
+    frequencies: Option<TokenFrequencyIndexView<'f>>,
     edges: Vec<Edge>,
     nodes: Nodes,
     /// `greedy[o]`: the greedy parse at needle offset `o`, computed once when
@@ -255,11 +272,14 @@ impl Builder<'_, '_, '_> {
     /// Term frequency of `set`. Summing an explicit set cannot overflow: its
     /// ids are distinct, so the sum is at most the code stream's length.
     fn frequency_of(&self, set: &ProbeSet) -> u32 {
+        let Some(frequencies) = self.frequencies else {
+            return 0;
+        };
         match set {
             ProbeSet::SetTooBig => 0,
-            ProbeSet::Point(id) => self.frequencies.frequency(*id),
-            ProbeSet::Range(range) => self.frequencies.range_frequency(*range),
-            ProbeSet::Set(ids) => ids.iter().map(|&id| self.frequencies.frequency(id)).sum(),
+            ProbeSet::Point(id) => frequencies.frequency(*id),
+            ProbeSet::Range(range) => frequencies.range_frequency(*range),
+            ProbeSet::Set(ids) => ids.iter().map(|&id| frequencies.frequency(id)).sum(),
         }
     }
 
@@ -326,7 +346,12 @@ impl Builder<'_, '_, '_> {
         // 0 that token is one the needle is a prefix of and the step runs
         // source to sink, which is why `contained_tokens` leaves those out: one
         // interval probes them, where the contained set would spend an id each.
-        let terminal_token_range = self.terminal_range(offset);
+        // At a row's end nothing follows the needle, so only the greedy step
+        // can end it.
+        let terminal_token_range = match self.anchor {
+            Anchor::End => TokenRange::EMPTY,
+            _ => self.terminal_range(offset),
+        };
         if !terminal_token_range.is_empty() {
             self.add_edge(
                 state,
@@ -339,7 +364,7 @@ impl Builder<'_, '_, '_> {
 
         if let Some((token, token_length)) = next_token {
             let next_offset = offset + token_length;
-            if next_offset < self.needle.len() {
+            if next_offset < self.needle.len() || self.anchor == Anchor::End {
                 self.add_edge(state, next_offset as u32, ProbeSet::Point(token));
             } else {
                 // A greedy step that reaches the needle's end consumed
@@ -396,7 +421,11 @@ pub(super) struct Candidates {
 }
 
 /// Both sets from the dictionary.
-pub(super) fn alignment_candidates(dict: CompactDictionaryView<'_>, needle: &[u8]) -> Candidates {
+pub(super) fn alignment_candidates(
+    dict: CompactDictionaryView<'_>,
+    needle: &[u8],
+    anchor: Anchor,
+) -> Candidates {
     let (payload, offsets) = dict.token_payload();
     let mut candidates = Candidates {
         first: FirstTokenSets::new(),
@@ -405,7 +434,7 @@ pub(super) fn alignment_candidates(dict: CompactDictionaryView<'_>, needle: &[u8
     if needle.len() > 1 {
         alignment_k1_candidates(payload, offsets, needle[0], &mut candidates.first);
     }
-    sweep_for_candidates(payload, offsets, needle, &mut candidates);
+    sweep_for_candidates(payload, offsets, needle, anchor, &mut candidates);
     candidates
 }
 
@@ -438,6 +467,7 @@ fn sweep_for_candidates(
     payload: &[u8],
     offsets: &[u32],
     needle: &[u8],
+    anchor: Anchor,
     candidates: &mut Candidates,
 ) {
     let needle_len = needle.len();
@@ -455,7 +485,13 @@ fn sweep_for_candidates(
             continue;
         }
         let at_token_start = hit_offset == token_begin;
-        if token_tail_from_hit.starts_with(needle) {
+        if anchor == Anchor::End && token_tail_from_hit.starts_with(needle) {
+            // Only a token ending with the needle can be a row's last; a later
+            // hit in the same token may still be one.
+            if !at_token_start && token_tail_from_hit.len() == needle_len {
+                candidates.contained.push(token_id as Token);
+            }
+        } else if token_tail_from_hit.starts_with(needle) {
             if !at_token_start {
                 candidates.contained.push(token_id as Token);
             }
@@ -472,14 +508,16 @@ fn sweep_for_candidates(
 }
 
 /// Build the alignment DAG for `needle` over `dict`, each probe carrying its
-/// term frequency in the indexed code stream.
+/// term frequency in the indexed code stream, or zero without `frequencies`.
+/// `anchor` keeps only the layouts a prefix or suffix can have.
 pub(super) fn build_alignment_graph(
     dict: CompactDictionaryView<'_>,
     needle: &[u8],
-    frequencies: TokenFrequencyIndexView<'_>,
+    frequencies: Option<TokenFrequencyIndexView<'_>>,
+    anchor: Anchor,
 ) -> AlignmentGraph {
     debug_assert!(!needle.is_empty());
-    debug_assert!(frequencies.num_tokens() == dict.num_tokens());
+    debug_assert!(frequencies.is_none_or(|f| f.num_tokens() == dict.num_tokens()));
 
     let n = needle.len();
     debug_assert!(n < u32::MAX as usize, "needle outgrew u32 node ids");
@@ -487,6 +525,7 @@ pub(super) fn build_alignment_graph(
     let mut b = Builder {
         dict,
         needle,
+        anchor,
         frequencies,
         edges: Vec::new(),
         nodes: Nodes::new(n),
@@ -494,8 +533,16 @@ pub(super) fn build_alignment_graph(
         built: vec![false; n],
     };
 
+    if anchor == Anchor::Start {
+        b.ensure_chain(0);
+        return AlignmentGraph {
+            edges: b.edges,
+            nodes: b.nodes,
+        };
+    }
+
     let kmax = n.min(MAX_TOKEN_SIZE);
-    let candidates = alignment_candidates(dict, needle);
+    let candidates = alignment_candidates(dict, needle, anchor);
     let (first, contained) = (&candidates.first, candidates.contained);
 
     for k in 0..kmax {

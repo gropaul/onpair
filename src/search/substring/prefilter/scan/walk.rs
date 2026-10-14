@@ -111,29 +111,38 @@ const LISTED: Edge = Edge {
 };
 
 impl EdgesByToken {
-    fn new(mut token_edges: Vec<(Token, Edge)>) -> Self {
-        token_edges.sort_unstable();
-        token_edges.dedup();
-        let (Some(&(first_token, _)), Some(&(last_token, _))) =
-            (token_edges.first(), token_edges.last())
+    /// Written straight into the table, so only the tokens on more than one
+    /// edge are sorted, not every pair.
+    fn new(token_edges: Vec<(Token, Edge)>) -> Self {
+        let Some((first_token, last_token)) = token_edges
+            .iter()
+            .map(|&(token, _)| (token, token))
+            .reduce(|(lo, hi), (t, _)| (lo.min(t), hi.max(t)))
         else {
             return Self::default();
         };
-        let mut edges = Self {
-            first_token,
-            edge_of_token: vec![NONE; usize::from(last_token - first_token) + 1],
-            edges_of_tokens: Vec::new(),
-        };
-        for same_token in token_edges.chunk_by(|a, b| a.0 == b.0) {
-            let (token, edge) = same_token[0];
-            edges.edge_of_token[usize::from(token - first_token)] = if same_token.len() == 1 {
-                edge
-            } else {
-                edges.edges_of_tokens.extend_from_slice(same_token);
-                LISTED
-            };
+        let mut edge_of_token = vec![NONE; usize::from(last_token - first_token) + 1];
+        let mut edges_of_tokens = Vec::new();
+        for (token, edge) in token_edges {
+            // SAFETY: first_token <= token <= last_token, the table's span.
+            let slot = unsafe { edge_of_token.get_unchecked_mut(usize::from(token - first_token)) };
+            match *slot {
+                NONE => *slot = edge,
+                LISTED => edges_of_tokens.push((token, edge)),
+                held if held == edge => {}
+                held => {
+                    edges_of_tokens.extend([(token, held), (token, edge)]);
+                    *slot = LISTED;
+                }
+            }
         }
-        edges
+        edges_of_tokens.sort_unstable();
+        edges_of_tokens.dedup();
+        Self {
+            first_token,
+            edge_of_token,
+            edges_of_tokens,
+        }
     }
 
     /// The table entry of `token`: its one edge, or a sentinel.
@@ -211,7 +220,7 @@ impl Walk {
     /// Whether an occurrence of the needle inside `codes[row_start..row_end]`
     /// has the covered token at `hit_code_index` as one of its parse steps.
     #[inline]
-    pub(super) fn check(
+    pub(in crate::search::substring::prefilter) fn check(
         &self,
         dict: CompactDictionaryView<'_>,
         codes: &[Token],
@@ -234,6 +243,26 @@ impl Walk {
                 .any(|&(_, edge)| passes(edge)),
             edge => passes(edge),
         }
+    }
+
+    /// Whether the row `codes` starts with the needle: the greedy chain from
+    /// the source at its first code. The graph must be built with
+    /// [`Anchor::Start`](super::super::graph::Anchor::Start).
+    #[inline]
+    pub(in crate::search::substring::prefilter) fn check_start(&self, codes: &[Token]) -> bool {
+        self.forward(SOURCE, 0, codes, codes.len())
+    }
+
+    /// Whether the row `codes` ends with the needle: the steps into the sink
+    /// back from its last code. The graph must be built with
+    /// [`Anchor::End`](super::super::graph::Anchor::End).
+    #[inline]
+    pub(in crate::search::substring::prefilter) fn check_end(
+        &self,
+        codes: &[Token],
+        dict: CompactDictionaryView<'_>,
+    ) -> bool {
+        self.backward(self.sink(), codes.len(), codes, 0, dict)
     }
 
     /// The greedy path from `node`, reading `codes[code_index..row_end]`,
@@ -276,7 +305,8 @@ impl Walk {
         // a greedy step's origin being `to` less the token's length, and a
         // token that steps into `node` is shorter than the prefix `node`
         // stands for, so it cannot also enter there. Terminal ranges all
-        // enter the sink, which `node` never is.
+        // enter the sink, which `node` is only for a suffix's graph, which
+        // has none.
         while node != SOURCE {
             if code_end <= row_start {
                 return false;
@@ -314,7 +344,7 @@ mod tests {
     use super::*;
     use crate::core::dictionary::{CompactDictionary, Dictionary, DictionaryView, pad_raw};
     use crate::search::index::build_token_frequency_index;
-    use crate::search::substring::prefilter::graph::build_alignment_graph;
+    use crate::search::substring::prefilter::graph::{Anchor, build_alignment_graph};
     use crate::search::tokenize;
 
     /// A complete dictionary of the single bytes plus `extra`, greedy-encoding
@@ -347,7 +377,8 @@ mod tests {
         let (dict, codes, row_offsets) = column(extra, rows);
         let dict = dict.as_view();
         let frequencies = build_token_frequency_index(&codes, dict.num_tokens()).unwrap();
-        let graph = build_alignment_graph(dict, needle, frequencies.as_view());
+        let graph =
+            build_alignment_graph(dict, needle, Some(frequencies.as_view()), Anchor::Anywhere);
         let walk = Walk::from_graph(&graph, needle);
         for (row, text) in rows.iter().enumerate() {
             let (start, end) = (row_offsets[row] as usize, row_offsets[row + 1] as usize);

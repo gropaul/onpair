@@ -19,8 +19,8 @@ use crate::core::validate::{InvalidColumn, panic_malformed};
 use crate::decoding;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 use crate::search::{
-    BytesVerifier, ContainsTable, PrefixQuery, analyze_prefilter, contains, equals,
-    prefilter_candidates, prefilter_superset, starts_with, tokenize,
+    BytesVerifier, ContainsTable, Finder, PrefixQuery, Verify, analyze_prefilter, contains, equals,
+    starts_with, tokenize,
 };
 
 /// Owned compressed column, produced by [`Column::compress`] /
@@ -197,7 +197,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     /// Ascending indices of the rows containing `pattern`, from the SIMD
     /// prefilter alone.
     ///
-    /// [`prefilter_candidates`] scans the code stream for the rows holding a
+    /// [`Finder::find`] scans the code stream for the rows holding a
     /// probe and verifies each hit against the alignment graph, so the rows
     /// come back exact and nothing runs behind it. Worth it exactly when the
     /// pattern is selective; a pattern most rows match is more cheaply answered
@@ -222,13 +222,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ) -> Vec<usize> {
         let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
         let mut rows = Vec::new();
-        prefilter_candidates(
-            self.codes,
-            self.row_offsets,
-            self.dict,
-            &analysis,
-            &mut rows,
-        );
+        Finder::new().find(*self, &analysis, Verify::Walk, None, &mut rows);
         rows
     }
 
@@ -250,7 +244,7 @@ impl<'a, O: Offset> ColumnView<'a, O> {
     ) -> Vec<usize> {
         let analysis = analyze_prefilter(pattern, self.dict, frequencies, self.num_rows());
         let mut rows = Vec::new();
-        prefilter_superset(self.codes, self.row_offsets, &analysis, &mut rows);
+        Finder::new().find(*self, &analysis, Verify::Superset, None, &mut rows);
         BytesVerifier::new(pattern).retain(*self, &mut rows);
         rows
     }

@@ -5,15 +5,15 @@
 
 use super::cover::ProbeCover;
 use super::graph::{
-    AlignmentGraph, Edge, PROBE_SET_SIZE_LIMIT, PROBE_SET_SIZE_LIMIT_K1, alignment_candidates,
-    build_alignment_graph,
+    AlignmentGraph, Anchor, Edge, PROBE_SET_SIZE_LIMIT, PROBE_SET_SIZE_LIMIT_K1,
+    alignment_candidates, build_alignment_graph,
 };
 use super::mincut::min_cut;
 use super::plan::{cheapest_cover, cover_frequency};
 use super::scan::{Region, scan_ns};
 use super::{
-    analyze_prefilter, prefilter_candidates, prefilter_hits, prefilter_is_likely_profitable,
-    prefilter_superset, prefilter_walk_hits,
+    AnchoredWalk, Finder, PrefilterAnalysis, Verify, analyze_prefilter,
+    prefilter_is_likely_profitable,
 };
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
@@ -23,6 +23,31 @@ use crate::search::index::{
 use crate::search::{ContainsTable, contains};
 use crate::{Column, ColumnView, DEFAULT_CONFIG, compress};
 
+/// Every row, walked.
+pub(super) fn scan_walk(
+    codes: &[Token],
+    row_offsets: &[u32],
+    dict: CompactDictionaryView<'_>,
+    analysis: &PrefilterAnalysis,
+    out: &mut Vec<usize>,
+) {
+    let view = ColumnView {
+        dict,
+        codes,
+        row_offsets,
+    };
+    Finder::new().find(view, analysis, Verify::Walk, None, out);
+}
+
+/// Every row, not walked.
+pub(super) fn scan_superset(
+    view: ColumnView<'_, u32>,
+    analysis: &PrefilterAnalysis,
+    out: &mut Vec<usize>,
+) {
+    Finder::new().find(view, analysis, Verify::Superset, None, out);
+}
+
 fn candidates<S: TokenFrequencyIndexStorage>(
     view: ColumnView<'_, u32>,
     dict: CompactDictionaryView<'_>,
@@ -31,7 +56,7 @@ fn candidates<S: TokenFrequencyIndexStorage>(
 ) -> Vec<usize> {
     let mut out = Vec::new();
     let analysis = analyze_prefilter(pattern, dict, frequencies, view.num_rows());
-    prefilter_candidates(view.codes, view.row_offsets, dict, &analysis, &mut out);
+    scan_walk(view.codes, view.row_offsets, dict, &analysis, &mut out);
     out
 }
 
@@ -97,7 +122,7 @@ fn first_token_sets_by_scan(
     (count, ids)
 }
 
-fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
+pub(super) fn compress_rows(rows: &[&[u8]]) -> Column<u32> {
     let mut bytes = Vec::new();
     let mut offsets = vec![0u32];
     for r in rows {
@@ -179,7 +204,12 @@ fn check_graph(
     pat: &[u8],
     want: &[usize],
 ) {
-    let graph = build_alignment_graph(view.dict, pat, frequencies.as_view());
+    let graph = build_alignment_graph(
+        view.dict,
+        pat,
+        Some(frequencies.as_view()),
+        Anchor::Anywhere,
+    );
     let probes: Vec<&Edge> = graph.edges.iter().filter(|edge| edge.cuttable()).collect();
 
     assert!(
@@ -264,7 +294,7 @@ fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
             .collect();
         if !pat.is_empty() {
             check_graph(view, &frequencies, pat, &want);
-            let candidates = alignment_candidates(view.dict, pat);
+            let candidates = alignment_candidates(view.dict, pat, Anchor::Anywhere);
             assert_eq!(
                 candidates.contained,
                 contained_tokens_by_scan(view.dict, pat),
@@ -282,7 +312,7 @@ fn check(rows: &[&[u8]], patterns: &[&[u8]]) {
             cand.extend(0..view.num_rows());
         } else {
             let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
-            prefilter_candidates(
+            scan_walk(
                 view.codes,
                 view.row_offsets,
                 view.dict,
@@ -331,7 +361,7 @@ fn contained_tokens_survive_a_match_spanning_two_tokens() {
 
     for pat in [b"aa".as_slice(), b"aaa", b"aaaa"] {
         assert_eq!(
-            alignment_candidates(dict, pat).contained,
+            alignment_candidates(dict, pat, Anchor::Anywhere).contained,
             contained_tokens_by_scan(dict, pat),
             "contained tokens for {pat:?} disagree with a per-token scan"
         );
@@ -413,7 +443,7 @@ fn empty_pattern_appends_all_rows() {
 
         let expected: Vec<_> = (0..rows.len()).collect();
         let mut got = vec![usize::MAX];
-        prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
+        scan_walk(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
         assert_eq!(got[0], usize::MAX);
         assert_eq!(got[1..], expected);
         assert_eq!(
@@ -440,7 +470,7 @@ fn empty_probe_cover_still_appends_nothing() {
 
     let dict = crate::compress(b"a", &[0u32, 1], DEFAULT_CONFIG).unwrap();
     let mut rows = vec![usize::MAX];
-    prefilter_candidates(
+    scan_walk(
         &[0],
         &[0u32, 0, 1, 1],
         dict.view().dict,
@@ -467,7 +497,7 @@ fn superset_verified_by_memmem_matches_the_walk() {
     for needle in [&b"a"[..], b"user", b"ing", b"e_", b"zzz", b""] {
         let analysis = analyze_prefilter(needle, view.dict, &frequencies, view.num_rows());
         let mut exact = Vec::new();
-        prefilter_candidates(
+        scan_walk(
             view.codes,
             view.row_offsets,
             view.dict,
@@ -475,62 +505,13 @@ fn superset_verified_by_memmem_matches_the_walk() {
             &mut exact,
         );
         let mut superset = Vec::new();
-        prefilter_superset(view.codes, view.row_offsets, &analysis, &mut superset);
+        scan_superset(view, &analysis, &mut superset);
         assert!(
             exact.iter().all(|row| superset.contains(row)),
             "superset dropped an exact row for {needle:?}"
         );
         BytesVerifier::new(needle).retain(view, &mut superset);
         assert_eq!(superset, exact, "verifiers disagree on {needle:?}");
-    }
-}
-
-#[test]
-fn walk_over_located_hits_matches_the_fused_walk() {
-    use crate::test_corpus::user_strings;
-    let corpus: Vec<Vec<u8>> = user_strings(50)
-        .into_iter()
-        .flat_map(|s| std::iter::repeat_n(s.into_bytes(), 4))
-        .collect();
-    let refs: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
-    let col = compress_rows(&refs);
-    let view = col.view();
-    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
-    for needle in [&b"a"[..], b"user", b"ing", b"e_", b"zzz", b""] {
-        let analysis = analyze_prefilter(needle, view.dict, &frequencies, view.num_rows());
-        let mut exact = Vec::new();
-        prefilter_candidates(
-            view.codes,
-            view.row_offsets,
-            view.dict,
-            &analysis,
-            &mut exact,
-        );
-        let mut superset = Vec::new();
-        prefilter_superset(view.codes, view.row_offsets, &analysis, &mut superset);
-        let mut hits = Vec::new();
-        prefilter_hits(
-            view.codes,
-            view.row_offsets,
-            &analysis,
-            &superset,
-            &mut hits,
-        );
-        assert!(
-            hits.windows(2)
-                .all(|w| w[0].row <= w[1].row && w[0].code < w[1].code),
-            "hits are not ascending for {needle:?}"
-        );
-        let mut walked = Vec::new();
-        prefilter_walk_hits(
-            view.codes,
-            view.row_offsets,
-            view.dict,
-            &analysis,
-            &hits,
-            &mut walked,
-        );
-        assert_eq!(walked, exact, "the split walk disagrees on {needle:?}");
     }
 }
 
@@ -599,7 +580,7 @@ fn prefilter_accepts_pattern_over_255_bytes() {
     let pat = vec![b'a'; 256];
     let mut candidates = Vec::new();
     let analysis = analyze_prefilter(&pat, view.dict, &frequencies, view.num_rows());
-    prefilter_candidates(
+    scan_walk(
         view.codes,
         view.row_offsets,
         view.dict,
@@ -749,7 +730,7 @@ fn wide_probe_cover_dispatches_soundly() {
     };
     let mut candidates = Vec::new();
 
-    super::scan::scan(&[0u16], &[0u32, 1], &pf, 1, &mut candidates);
+    super::scan::scan_cover(&[0u16], &[0u32, 1], &pf, 1, &mut candidates);
     assert_eq!(candidates, vec![0]);
 }
 
@@ -780,7 +761,7 @@ fn each_hit_row_is_appended_once_in_order() {
 
     let pf = ProbeCover::from_runs(vec![TokenRange { begin: 1, last: 2 }]);
     let mut out = Vec::new();
-    super::scan::scan(&codes, &row_offsets, &pf, 43, &mut out);
+    super::scan::scan_cover(&codes, &row_offsets, &pf, 43, &mut out);
     assert_eq!(out, vec![1, 4]);
 
     let mut oracle = Vec::new();
@@ -876,7 +857,7 @@ fn sweep_prices_at_or_below_the_frequency_cut() {
         b".com/page",
         b"https://www.example.com",
     ] {
-        let graph = build_alignment_graph(view.dict, pat, freq);
+        let graph = build_alignment_graph(view.dict, pat, Some(freq), Anchor::Anywhere);
         let by_frequency = min_cut(&graph.edges, graph.nodes, |edge| {
             u64::from(edge.frequency())
         });
@@ -910,10 +891,153 @@ fn split_scan_returns_exact_rows() {
     for pat in [b"example".as_slice(), b".com", b"://", b"page", b"user"] {
         let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
         let mut got = Vec::new();
-        prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
+        scan_walk(view.codes, view.row_offsets, view.dict, &analysis, &mut got);
         let want: Vec<usize> = (0..view.num_rows())
             .filter(|&k| byte_contains(&decode_row(view, k), pat))
             .collect();
         assert_eq!(got, want, "{pat:?}");
     }
+}
+
+#[test]
+fn selected_scan_is_the_full_scan_filtered() {
+    use crate::test_corpus::user_strings;
+    let corpus: Vec<Vec<u8>> = user_strings(3000)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    let col = compress_rows(&rows);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let n = view.num_rows() as u32;
+    let selections: Vec<Vec<u32>> = vec![
+        vec![],
+        vec![0],
+        vec![n - 1],
+        (0..n).collect(),
+        (0..n).step_by(7).collect(),
+        (0..n).filter(|r| (r / 40) % 3 == 0).collect(),
+        (0..n)
+            .filter(|r| r.wrapping_mul(2654435761) % 97 < 3)
+            .collect(),
+    ];
+    for pat in [
+        b"example".as_slice(),
+        b".com",
+        b"://",
+        b"page",
+        b"user",
+        b"",
+        b"zzzzqq",
+    ] {
+        let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
+        for verify in [Verify::Walk, Verify::Superset] {
+            let mut full = Vec::new();
+            Finder::new().find(view, &analysis, verify, None, &mut full);
+            for sel in &selections {
+                let mut got = Vec::new();
+                Finder::new().find(view, &analysis, verify, Some(sel), &mut got);
+                let want: Vec<usize> = full
+                    .iter()
+                    .copied()
+                    .filter(|&r| sel.binary_search(&(r as u32)).is_ok())
+                    .collect();
+                assert_eq!(got, want, "{pat:?}, {} selected", sel.len());
+            }
+        }
+    }
+}
+
+/// The per-row scan of a sparse selection over rows of several 64-code blocks,
+/// with the match in a late block, empty rows, and the last row selected.
+#[test]
+fn sparse_selection_over_long_rows() {
+    let corpus: Vec<Vec<u8>> = (0..600u32)
+        .map(|i| match i % 7 {
+            0 => Vec::new(),
+            _ => {
+                let mut row: Vec<u8> = (0..60 + i % 50)
+                    .flat_map(|j| format!("w{} ", (i * 31 + j) % 997).into_bytes())
+                    .collect();
+                if i % 3 == 0 {
+                    row.extend_from_slice(b"sunflower");
+                }
+                row
+            }
+        })
+        .collect();
+    let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    let col = compress_rows(&rows);
+    let view = col.view();
+    let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
+    let n = view.num_rows() as u32;
+    let sel: Vec<u32> = (0..n)
+        .filter(|r| r % 41 == 0 || r % 41 == 3 || *r == n - 1)
+        .collect();
+    for pat in [b"sunflower".as_slice(), b"w1", b"zzzzqq"] {
+        let analysis = analyze_prefilter(pat, view.dict, &frequencies, view.num_rows());
+        let mut full = Vec::new();
+        Finder::new().find(view, &analysis, Verify::Walk, None, &mut full);
+        let mut got = Vec::new();
+        Finder::new().find(view, &analysis, Verify::Walk, Some(&sel), &mut got);
+        let want: Vec<usize> = full
+            .iter()
+            .copied()
+            .filter(|&r| sel.binary_search(&(r as u32)).is_ok())
+            .collect();
+        assert_eq!(got, want, "{pat:?}");
+    }
+}
+
+/// Every row's heads and tails as patterns, plus a few that start or end no
+/// row, through both walks against byte prefix and suffix on the decoded rows.
+fn check_prefix_suffix(rows: &[&[u8]], extra: &[&[u8]]) {
+    let col = compress_rows(rows);
+    let view = col.view();
+    let mut patterns: Vec<Vec<u8>> = extra.iter().map(|p| p.to_vec()).collect();
+    for row in rows {
+        for len in 1..=row.len().min(24) {
+            patterns.push(row[..len].to_vec());
+            patterns.push(row[row.len() - len..].to_vec());
+        }
+    }
+    patterns.sort();
+    patterns.dedup();
+    let decoded: Vec<Vec<u8>> = (0..view.num_rows()).map(|k| decode_row(view, k)).collect();
+    for pat in &patterns {
+        for anchor in [Anchor::Start, Anchor::End] {
+            let walk = AnchoredWalk::new(pat, view.dict, anchor);
+            let got: Vec<usize> = (0..view.num_rows())
+                .filter(|&k| walk.matches(view.row_codes(k), view.dict))
+                .collect();
+            let want: Vec<usize> = (0..view.num_rows())
+                .filter(|&k| match anchor {
+                    Anchor::End => decoded[k].ends_with(pat),
+                    _ => decoded[k].starts_with(pat),
+                })
+                .collect();
+            assert_eq!(got, want, "{anchor:?} {pat:?}");
+        }
+    }
+}
+
+#[test]
+fn prefix_and_suffix_walks_match_brute_force_on_repetitive_corpus() {
+    use crate::test_corpus::user_strings;
+    let corpus: Vec<Vec<u8>> = user_strings(50)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+    let rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    check_prefix_suffix(&rows, &[b"", b"zzz", b"https://www.example.com/", b".com/"]);
+}
+
+#[test]
+fn prefix_and_suffix_walks_match_brute_force_on_binary_corpus() {
+    use crate::test_corpus::binary_strings;
+    let corpus = binary_strings(40, 24, 11);
+    let mut rows: Vec<&[u8]> = corpus.iter().map(Vec::as_slice).collect();
+    rows.push(b"");
+    check_prefix_suffix(&rows, &[b"\x00", b"\xff\xff", &[7u8]]);
 }

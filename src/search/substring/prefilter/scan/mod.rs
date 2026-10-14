@@ -27,8 +27,8 @@ pub(in crate::search::substring::prefilter) use policy::{Facts, Region, scan_ns}
 use resolver::Resolver;
 pub(in crate::search::substring::prefilter) use walk::Walk;
 
+use super::PrefilterAnalysis;
 use super::cover::ProbeCover;
-use super::{PrefilterAnalysis, PrefilterHit};
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
@@ -106,7 +106,7 @@ fn expected_hits(covered_frequency: usize, total_frequency: usize, code_count: u
 /// Compatibility entry for tests that exercise dispatch with a synthetic
 /// cover, without constructing a complete analysis.
 #[cfg(test)]
-pub(super) fn scan<O: Offset>(
+pub(super) fn scan_cover<O: Offset>(
     codes: &[Token],
     row_offsets: &[O],
     cover: &ProbeCover,
@@ -114,79 +114,23 @@ pub(super) fn scan<O: Offset>(
     out: &mut Vec<usize>,
 ) {
     let input = ScanInput::full(codes, row_offsets, cover);
-    execute_check(
+    execute(
         facts(input, covered_frequency, codes.len()),
         input,
-        Check::Superset,
+        Check::SUPERSET,
+        None,
         out,
     );
 }
 
-/// Execute a previously derived plan without the walk: every hit's row is a
-/// candidate. The superset [`execute`] would have verified.
-#[inline]
-pub(super) fn execute_superset<O: Offset>(
-    plan: ScanPlan,
-    input: ScanInput<'_, O>,
-    out: &mut Vec<usize>,
-) {
-    execute_check(plan, input, Check::Superset, out);
-}
-
 /// Execute a previously derived plan. This is the first stage that inspects
-/// code values. Every hit goes through `walk`, so the rows are exact.
-#[inline]
+/// code values: `check` is what a hit passes before its row goes out, and
+/// `sel` the rows scanned, every row without it.
 pub(super) fn execute<O: Offset>(
     plan: ScanPlan,
     input: ScanInput<'_, O>,
-    walk: &Walk,
-    dict: CompactDictionaryView<'_>,
-    out: &mut Vec<usize>,
-) {
-    let codes = input.codes;
-    execute_check(plan, input, Check::Walk { walk, dict, codes }, out);
-}
-
-
-/// The walk alone, over hits located beforehand: what
-/// [`prefilter_walk_hits`](super::prefilter_walk_hits) runs. A row is emitted
-/// at its first passing hit and its remaining hits are skipped rather than
-/// walked, which is what the resolver does with the rest of a row's mask.
-pub(super) fn walk_hits<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    walk: &Walk,
-    dict: CompactDictionaryView<'_>,
-    hits: &[PrefilterHit],
-    out: &mut Vec<usize>,
-) {
-    let mut i = 0;
-    while i < hits.len() {
-        let row = hits[i].row;
-        let start = row_offsets[row].to_usize();
-        let end = row_offsets[row + 1].to_usize();
-        let mut passed = false;
-        while i < hits.len() && hits[i].row == row {
-            if walk.check(dict, codes, start, end, hits[i].code) {
-                passed = true;
-                break;
-            }
-            i += 1;
-        }
-        if passed {
-            out.push(row);
-            while i < hits.len() && hits[i].row == row {
-                i += 1;
-            }
-        }
-    }
-}
-
-/// The plan under whatever stage two asks of a hit.
-fn execute_check<O: Offset>(
-    plan: ScanPlan,
-    input: ScanInput<'_, O>,
     check: Check<'_>,
+    sel: Option<&[u32]>,
     out: &mut Vec<usize>,
 ) {
     let Some(facts) = plan else {
@@ -198,6 +142,7 @@ fn execute_check<O: Offset>(
         input.codes,
         input.row_offsets,
         check,
+        sel,
         out,
     );
 }
@@ -219,8 +164,10 @@ pub(super) fn scan_scalar<O: Offset>(
     }
 }
 
-/// Codes per block, 64 words of mask. Kernels rely on the multiple of 64.
-pub(in crate::search::substring::prefilter) const BLOCK: usize = 512;
+/// Mask words per block.
+pub(in crate::search::substring::prefilter) const WORDS: usize = 8;
+/// Codes per block. Kernels rely on the multiple of 128.
+pub(in crate::search::substring::prefilter) const BLOCK: usize = 64 * WORDS;
 
 /// The instruction set this build's kernels run on. The other thing a cost
 /// is per: the same kernel is a different cost on each, since what a range
@@ -254,38 +201,39 @@ impl Isa {
 /// One block of codes, exactly what a matcher is handed.
 type Block = [Token; BLOCK];
 /// One block of mask, bit `i` for code `i` of the block.
-type Mask = [u64; BLOCK / 64];
+type Mask = [u64; WORDS];
 
-/// What stage two asks of a hit before its row goes out. The planner's
-/// scans apply the walk; `Superset` leaves verification to the caller, and
-/// is how the benches time the two stages without the walk's per-hit cost.
+/// What stage two asks of a hit before its row goes out.
 #[derive(Clone, Copy)]
-enum Check<'a> {
-    /// Nothing: every hit's row is a candidate.
-    Superset,
-    /// The alignment walk over the codes: only a hit some occurrence of the
-    /// needle parses through has its row emitted.
-    Walk {
-        walk: &'a Walk,
-        dict: CompactDictionaryView<'a>,
-        codes: &'a [Token],
-    },
+pub(super) struct Check<'a> {
+    /// The alignment walk a hit must pass; `None` passes every hit.
+    pub(super) walk: Option<WalkCheck<'a>>,
+}
+
+/// The walk and what it reads.
+#[derive(Clone, Copy)]
+pub(super) struct WalkCheck<'a> {
+    pub(super) walk: &'a Walk,
+    pub(super) dict: CompactDictionaryView<'a>,
+    pub(super) codes: &'a [Token],
 }
 
 impl Check<'_> {
-    /// Whether the hit at stream index `code`, inside the row
+    /// Every hit's row is a candidate.
+    #[cfg(test)]
+    pub(super) const SUPERSET: Check<'static> = Check { walk: None };
+
+    /// Whether the hit at stream index `code`, inside the row spanning
     /// `[row_start, row_end)`, passes.
     #[inline]
     fn passes(&self, code: usize, row_start: usize, row_end: usize) -> bool {
-        match *self {
-            Self::Superset => true,
-            Self::Walk { walk, dict, codes } => walk.check(dict, codes, row_start, row_end, code),
-        }
+        self.walk
+            .is_none_or(|w| w.walk.check(w.dict, w.codes, row_start, row_end, code))
     }
 }
 
 /// Both stages over a whole stream. Rows come out ascending and unique.
-fn both_stages<'a, M: Matcher, R: Resolver<'a>>(
+fn scan<'a, M: Matcher, R: Resolver<'a>>(
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &'a [R::Offset],
@@ -294,7 +242,7 @@ fn both_stages<'a, M: Matcher, R: Resolver<'a>>(
 ) {
     let matcher = M::new(cover);
     let mut resolver = R::new(row_offsets);
-    let mut bits = [0u64; BLOCK / 64];
+    let mut bits = [0u64; WORDS];
     blocks(codes, &mut |block, at, valid| {
         // A block the matcher reports empty costs stage two nothing.
         if matcher.check(block, &mut bits) {
@@ -319,6 +267,54 @@ fn blocks(codes: &[Token], step: &mut dyn FnMut(&Block, usize, usize)) {
         let mut tail = [Token::default(); BLOCK];
         tail[..rest].copy_from_slice(&codes[at..]);
         step(&tail, at, rest);
+    }
+}
+
+/// The matcher over each row of `sel` from its first code, a word at a time,
+/// reading 64 codes that run past the row's end: the bits past it are
+/// cleared, and every other hit is the row's own, so no resolver is asked.
+/// The row goes out on its first hit that passes `check`, and the rest of it
+/// is never read. `sel` is ascending row indices below the row count.
+fn scan_rows<M: Matcher, O: Offset>(
+    cover: &ProbeCover,
+    codes: &[Token],
+    row_offsets: &[O],
+    sel: &[u32],
+    check: Check<'_>,
+    out: &mut Vec<usize>,
+) {
+    let matcher = M::new(cover);
+    // The stream's last 63 codes, read through a copy; what lies past the
+    // row is masked off, so the copy's stale rest does no harm.
+    let mut tail = [Token::default(); 64];
+    'rows: for &r in sel {
+        let r = r as usize;
+        let (start, end) = (row_offsets[r].to_usize(), row_offsets[r + 1].to_usize());
+        let mut at = start;
+        while at < end {
+            let rest = &codes[at..];
+            let block = match rest.first_chunk::<64>() {
+                Some(block) => block,
+                None => {
+                    tail[..rest.len()].copy_from_slice(rest);
+                    &tail
+                }
+            };
+            let n = (end - at).min(64);
+            let mut set = matcher.check_row(block, n);
+            if n < 64 {
+                set &= (1 << n) - 1;
+            }
+            while set != 0 {
+                let code = at + set.trailing_zeros() as usize;
+                if check.passes(code, start, end) {
+                    out.push(r);
+                    continue 'rows;
+                }
+                set &= set - 1;
+            }
+            at += 64;
+        }
     }
 }
 
@@ -372,9 +368,9 @@ mod tests {
             ranges: Vec::new(),
         };
         let mut out = Vec::new();
-        scan(&[], &[0u32, 0, 0, 0], &cover, 0, &mut out);
+        scan_cover(&[], &[0u32, 0, 0, 0], &cover, 0, &mut out);
         assert!(out.is_empty());
-        scan(&[], &[0u64, 0, 0, 0], &cover, 0, &mut out);
+        scan_cover(&[], &[0u64, 0, 0, 0], &cover, 0, &mut out);
         assert!(out.is_empty());
     }
 

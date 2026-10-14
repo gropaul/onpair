@@ -1,55 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! SIMD prefilter for substring search.
+//! SIMD prefilter for substring search. It compiles a sound probe cover from the
+//! pattern and scans the code stream for the rows holding a probe token.
 //!
-//! Answering `LIKE '%pattern%'` exactly means checking every row — e.g. stepping
-//! the token-level KMP automaton of [`contains`](super::contains()) over its
-//! codes. This module trims that per-row work down to the rows that *can* match.
-//! It compiles a **sound probe cover** from the pattern — dictionary token ids
-//! and id ranges chosen so that *any* row containing the pattern holds at least
-//! one probe token — then scans the flat code stream for the rows holding one
-//! ([`prefilter_candidates`]).
-//!
-//! Every hit is then checked against the alignment graph in the compressed
-//! domain (`walk`), so the rows [`prefilter_candidates`] returns are exactly
-//! the rows containing the pattern and no caller-side verification is needed.
-//!
-//! An empty pattern matches every row, including rows without codes. Its
-//! analysis needs no probes, and execution appends all rows without scanning.
-//!
-//! # Soundness
-//! Every occurrence of a non-empty pattern in an encoded row falls into one of two cases,
-//! and the cover covers both:
-//!
-//! * **One token contains the whole pattern.** Its id is added unconditionally
-//!   (only reachable when `pattern.len() <= MAX_TOKEN_SIZE`), as the range of
-//!   tokens the pattern is a prefix of or as the set holding it further in.
-//! * **The occurrence crosses at least one token boundary.** Then it begins at
-//!   some feasible first-token alignment `k`, after which greedy parsing of
-//!   `pattern[k..]` is deterministic. Every such layout is one path through the
-//!   alignment DAG, and the cover is a cut of that DAG — so whichever layout the
-//!   occurrence takes, it runs into a probe.
-//!
-//! # Shape
-//! * [`TokenFrequencyIndex`] — the reusable per-column selectivity index the
-//!   compiler reads and the caller owns.
-//! * `graph` — pattern to alignment DAG: every layout of the pattern across
-//!   token boundaries, as one graph whose cuts are exactly the sound covers.
-//! * `mincut` — the cheapest such cut, by max-flow over the split DAG, under
-//!   whatever edge weights it is handed.
-//! * `plan` — the three end to end: pattern in, the cover the model prices
-//!   lowest out, preserving every selected id regardless of its advisory
-//!   frequency.
-//! * `cover` — the cover itself, in both the shapes the scan wants.
-//! * `walk` — the graph flattened for checking a hit in codes, forward to the
-//!   sink and back to the source.
-//! * `scan` — the vector kernels and, in `policy`, the fitted cost model
-//!   that picks them and prices a cover. Profitability stays outside execution.
+//! The cover is sound because every occurrence either sits inside one token,
+//! whose id is added unconditionally, or crosses a token boundary and so is a
+//! path through the alignment DAG, which the cover cuts.
 
 mod cover;
 mod graph;
 mod mincut;
+mod paper;
 mod plan;
 mod scan;
 mod trace;
@@ -58,18 +20,17 @@ mod trace;
 mod tests;
 
 pub use cover::ProbeCover;
+pub use graph::Anchor;
+pub use paper::{PrefilterHit, prefilter_hits, prefilter_walk_hits};
 pub use trace::{PrefilterTrace, TraceEdge, TraceLabel, trace_prefilter};
 
+use crate::ColumnView;
 use crate::core::dictionary::CompactDictionaryView;
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::index::{TokenFrequencyIndex, TokenFrequencyIndexStorage};
 
-/// The normalized probe cover selected for a pattern and its frequency, or an
-/// all-rows result.
-///
-/// Points and ranges are disjoint, so each covered token occurrence is counted
-/// exactly once. An empty pattern matches all rows and needs no probes.
+/// The probe cover chosen for a pattern, with its frequency and cost.
 #[derive(Debug, Clone)]
 pub struct PrefilterAnalysis {
     probe_cover: ProbeCover,
@@ -77,37 +38,27 @@ pub struct PrefilterAnalysis {
     total_frequency: u32,
     scan_ns: f64,
     walk: scan::Walk,
-    /// Empty patterns admit even rows without codes, independently of the cover.
+    /// An empty pattern: every row matches, including rows without codes.
     matches_all: bool,
 }
 
 impl PrefilterAnalysis {
-    /// The normalized checks the SIMD prefilter can execute.
-    ///
-    /// For an empty pattern this cover is empty, but [`prefilter_candidates`]
-    /// still returns every row.
+    /// The probe cover; empty for an empty pattern, which still matches every row.
     pub fn probe_cover(&self) -> &ProbeCover {
         &self.probe_cover
     }
 
-    /// Expected nanoseconds to scan the cover over the analyzed stream and
-    /// verify the rows it admits, from the fitted kernel model. The number
-    /// the cover was chosen by, so alternatives compare against it directly.
-    /// Zero for an empty pattern, which scans nothing.
+    /// Modelled nanoseconds to scan the cover and walk its hits, the cost the cover was chosen by.
     pub fn expected_scan_ns(&self) -> f64 {
         self.scan_ns
     }
 
-    /// Number of code positions whose token is covered by the probes.
-    /// Zero for an empty pattern, which needs no probes.
+    /// Code positions whose token the cover holds.
     pub fn covered_frequency(&self) -> u32 {
         self.covered_frequency
     }
 
-    /// Fraction of code positions whose token is covered by the probes.
-    ///
-    /// Returns `0.0` when the indexed code stream is empty or the pattern is
-    /// empty and needs no probes.
+    /// Covered over total frequency, `0.0` for an empty stream.
     pub fn covered_fraction(&self) -> f64 {
         if self.total_frequency == 0 {
             0.0
@@ -116,13 +67,12 @@ impl PrefilterAnalysis {
         }
     }
 
-    /// Number of code positions represented by the frequency index.
+    /// Code positions the frequency index counts.
     pub fn total_frequency(&self) -> u32 {
         self.total_frequency
     }
 
-    /// SIMD comparisons each vector of the code stream pays for this cover: one
-    /// per point, two per inclusive range. Zero for an empty pattern.
+    /// SIMD comparisons per vector: one per point, two per range.
     pub fn comparison_cost(&self) -> usize {
         let cover = self.probe_cover();
         cover
@@ -131,13 +81,8 @@ impl PrefilterAnalysis {
             .saturating_add(cover.ranges().len().saturating_mul(2))
     }
 
-    /// Expected share of `row_count` rows the scan will admit for verification.
-    ///
-    /// Verification is charged per row, so the estimate is covered codes per
-    /// row: exact when no row holds two covered codes, an over-estimate
-    /// otherwise. Returns `0.0` for an empty region and never exceeds `1.0`.
-    /// An empty pattern admits every row, so its fraction is `1.0` for any
-    /// non-empty region, even one consisting entirely of empty rows.
+    /// Expected share of `row_count` rows holding a covered code, an over-estimate
+    /// when rows hold several.
     pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
         if row_count == 0 {
             return 0.0;
@@ -149,56 +94,26 @@ impl PrefilterAnalysis {
     }
 }
 
-/// Widest cover the specialized SIMD kernels serve; wider covers fall through to
-/// a generic loop costing roughly 1.8x more per comparison.
+/// Widest cover the SIMD kernels serve before a generic loop takes over.
 const MAX_SIMD_COMPARISONS: usize = 16;
 
-/// Largest share of rows the default policy sends to exact verification, which
-/// costs 2.1x to 6.5x per row what bulk decoding does.
+/// Largest share of rows the default policy sends to per-row verification.
 const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
 
-/// Return whether the default empirical policy expects prefiltering to beat a
-/// bulk-decode fallback over a region of `row_count` rows.
-///
-/// The policy prices the two costs a scan pays, both known after
-/// [`analyze_prefilter`]: its
-/// [`comparison_cost`](PrefilterAnalysis::comparison_cost) per code, and the
-/// [`expected_candidate_row_fraction`](PrefilterAnalysis::expected_candidate_row_fraction)
-/// it sends to per-row verification. For a non-empty pattern, an empty cover
-/// passes both: it proves no encoded row can match, so it scans nothing and
-/// admits nothing. An empty pattern also passes: its all-rows answer is exact
-/// and requires neither a scan nor verification.
-///
-/// This is a performance hint, not a correctness requirement, and it neither
-/// executes nor bypasses the prefilter. The thresholds were calibrated on
-/// AArch64 over 2877 `contains` queries against a bulk-decode-plus-`memmem`
-/// fallback, where they admit no query the fallback would have won. Callers
-/// with materially different columns or architectures may choose their own
-/// policy.
+/// Whether prefiltering `row_count` rows is expected to beat bulk decoding, a hint
+/// calibrated on AArch64 against decode plus `memmem`.
 pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {
     analysis.matches_all
         || (analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
             && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION)
 }
 
-/// Analyze `pattern` and return the sound probe cover the scan cost model
-/// prices lowest over a stream of `row_count` rows.
+/// The sound probe cover the cost model prices lowest for `pattern` over `row_count` rows.
 ///
-/// This function constructs the checks and reports their frequency and cost;
-/// the caller decides whether executing them is profitable. An empty pattern
-/// produces an analysis that admits every row without compiling probes.
-///
-/// # Precondition
-/// `dict` is conformant: sorted, complete, and unique. These properties are
-/// guaranteed for a dictionary trained by [`Parser::train`](crate::Parser::train)
-/// or passed through [`CompactDictionary::validate`](crate::CompactDictionary::validate).
-/// `frequencies` must use `dict`'s token domain and the scanned code count.
-/// Values are advisory weights: they affect the plan and profitability, but
-/// never remove members from the resulting cover.
-///
-/// # Panics
-/// Panics when `pattern` is longer than [`MAX_PATTERN_LEN`], which is what the
-/// alignment walk's node ids hold.
+/// `dict` is sorted, complete and unique, as [`Parser::train`](crate::Parser::train)
+/// builds it, and `frequencies` counts its tokens over the scanned codes. The
+/// frequencies steer the plan only; the cover stays sound whatever they are.
+/// Panics past [`MAX_PATTERN_LEN`] bytes.
 pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     pattern: &[u8],
     dict: CompactDictionaryView<'_>,
@@ -231,139 +146,150 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
     }
 }
 
-/// Execute `analysis` and append the ascending rows containing the pattern.
-///
-/// The rows are exact, not a superset: every hit on the cover is verified
-/// against the alignment graph in the compressed domain, so no caller-side
-/// check such as [`contains`](super::contains()) or a
-/// [`BytesVerifier`](super::BytesVerifier) is needed behind this.
-///
-/// This function only executes the analyzed cover; the caller decides whether
-/// scanning it is profitable. For a non-empty pattern, an empty cover appends
-/// nothing. An empty pattern appends every row, including empty rows, without
-/// scanning.
-///
-/// # Precondition
-/// `row_offsets` are valid delimiters for `codes`, every code lies in the
-/// token domain of the analyzed cover, and `dict` is the dictionary the
-/// analysis was built over. A validated [`Column`](crate::Column) and an
-/// analysis built for that column satisfy these properties.
-pub fn prefilter_candidates<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    dict: CompactDictionaryView<'_>,
-    analysis: &PrefilterAnalysis,
-    out: &mut Vec<usize>,
-) {
-    if analysis.matches_all {
-        out.extend(0..row_offsets.len().saturating_sub(1));
-        return;
-    }
-    let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
-    let plan = scan::plan(input, analysis);
-    scan::execute(plan, input, &analysis.walk, dict, out);
+/// A pattern prepared for the rows that start or end with it. The row fixes
+/// where a prefix or suffix sits, so there is no cover to scan: the walk runs
+/// once per row, forward from its first code or back from its last, over the
+/// alignment graph of the layouts that position allows.
+#[derive(Debug, Clone)]
+pub struct AnchoredWalk {
+    walk: scan::Walk,
+    anchor: Anchor,
+    /// An empty pattern: every row starts and ends with it.
+    matches_all: bool,
 }
 
-/// Execute `analysis` and append the ascending rows holding a covered token,
-/// without the walk.
-///
-/// The result is a **sound superset** of the rows containing the pattern: the
-/// caller verifies the survivors with an exact check such as a
-/// [`BytesVerifier`](super::BytesVerifier) or [`contains`](super::contains()).
-/// This is the path [`prefilter_candidates`] is measured against; the walk
-/// replaces the per-row decode with a check on the codes around each hit.
-///
-/// Empty covers and empty patterns behave as in [`prefilter_candidates`].
-///
-/// # Precondition
-/// As [`prefilter_candidates`], minus the dictionary.
-pub fn prefilter_superset<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    analysis: &PrefilterAnalysis,
-    out: &mut Vec<usize>,
-) {
-    if analysis.matches_all {
-        out.extend(0..row_offsets.len().saturating_sub(1));
-        return;
-    }
-    let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
-    let plan = scan::plan(input, analysis);
-    scan::execute_superset(plan, input, out);
-}
-
-/// A covered token occurrence: the row it falls in, and its index in the code
-/// stream. What the scan kernels hand the walk, recorded so the walk can be
-/// timed without them. See [`prefilter_hits`].
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct PrefilterHit {
-    /// The row the occurrence falls in.
-    pub row: usize,
-    /// Its index in `codes`.
-    pub code: usize,
-}
-
-/// Append every covered token occurrence inside `rows`, ascending.
-///
-/// `rows` are the candidate rows [`prefilter_superset`] admitted. This locates
-/// scalar-wise what the kernels locate, so that [`prefilter_walk_hits`] can be
-/// measured with nothing in front of it; the executing paths never call it.
-///
-/// # Precondition
-/// As [`prefilter_superset`], and every entry of `rows` is a valid row index.
-pub fn prefilter_hits<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    analysis: &PrefilterAnalysis,
-    rows: &[usize],
-    out: &mut Vec<PrefilterHit>,
-) {
-    if analysis.matches_all {
-        return;
-    }
-    let cover = analysis.probe_cover();
-    for &row in rows {
-        let start = row_offsets[row].to_usize();
-        let end = row_offsets[row + 1].to_usize();
-        out.extend(
-            (start..end)
-                .filter(|&code| cover.contains(codes[code]))
-                .map(|code| PrefilterHit { row, code }),
+impl AnchoredWalk {
+    /// Prepares `pattern` against the sorted, complete `dict`.
+    ///
+    /// # Panics
+    /// On [`Anchor::Anywhere`], which is [`analyze_prefilter`]'s, or past
+    /// [`MAX_PATTERN_LEN`] bytes.
+    pub fn new(pattern: &[u8], dict: CompactDictionaryView<'_>, anchor: Anchor) -> Self {
+        assert!(
+            anchor != Anchor::Anywhere,
+            "a substring is analyze_prefilter's"
         );
+        assert!(
+            pattern.len() <= MAX_PATTERN_LEN,
+            "pattern of {} bytes exceeds the walk's {MAX_PATTERN_LEN}",
+            pattern.len()
+        );
+        if pattern.is_empty() {
+            return Self {
+                walk: scan::Walk::default(),
+                anchor,
+                matches_all: true,
+            };
+        }
+        let graph = graph::build_alignment_graph(dict, pattern, None, anchor);
+        Self {
+            walk: scan::Walk::from_graph(&graph, pattern),
+            anchor,
+            matches_all: false,
+        }
+    }
+
+    /// Whether the row `codes` starts (or ends) with the pattern.
+    #[inline]
+    pub fn matches(&self, codes: &[Token], dict: CompactDictionaryView<'_>) -> bool {
+        if self.matches_all {
+            return true;
+        }
+        match self.anchor {
+            Anchor::End => self.walk.check_end(codes, dict),
+            _ => self.walk.check_start(codes),
+        }
     }
 }
 
-/// Walk `hits` and append the rows the pattern occurs in, ascending.
-///
-/// The exact half of [`prefilter_candidates`] with the scan taken out: given
-/// the hits the kernels would have produced, this performs the same alignment
-/// walks in the same order, stopping at a row's first passing hit as the
-/// resolver does. Over the hits of [`prefilter_superset`]'s rows it returns
-/// [`prefilter_candidates`]'s rows exactly.
-///
-/// This exists to price the walk per candidate row against the verifiers it
-/// replaces, which are themselves timed over a candidate list. It is slower
-/// than the fused path it measures, which walks a hit the kernel has just
-/// produced, and is not a faster way to answer the query.
-///
-/// # Precondition
-/// `hits` is ascending by row, as [`prefilter_hits`] produces it, and the
-/// preconditions of [`prefilter_candidates`] hold.
-pub fn prefilter_walk_hits<O: Offset>(
-    codes: &[Token],
-    row_offsets: &[O],
-    dict: CompactDictionaryView<'_>,
-    analysis: &PrefilterAnalysis,
-    hits: &[PrefilterHit],
-    out: &mut Vec<usize>,
-) {
-    if analysis.matches_all {
-        out.extend(0..row_offsets.len().saturating_sub(1));
-        return;
-    }
-    scan::walk_hits(codes, row_offsets, &analysis.walk, dict, hits, out);
+/// What a hit on the cover must pass before its row goes out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Verify {
+    /// Nothing: every row holding a covered token, which the caller verifies.
+    Superset,
+    /// The alignment walk: exactly the rows containing the pattern.
+    Walk,
 }
 
-/// The longest pattern [`analyze_prefilter`] takes: one node per needle offset
-/// plus the sink, all of them inside the walk's `u16` ids.
+/// Scans of one row group, keeping the selection's scratch across queries.
+#[derive(Debug, Default)]
+pub struct Finder {
+    /// One byte per row of the row group, 1 where the selection holds the row.
+    selected: Vec<u8>,
+}
+
+impl Finder {
+    /// A finder without scratch yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append the ascending rows of `view`, or of `sel` only, that `verify` admits.
+    ///
+    /// `view` is valid, `analysis` was built over `view.dict`, and `sel` holds
+    /// ascending row indices without repeats, all inside the row group.
+    pub fn find<O: Offset>(
+        &mut self,
+        view: ColumnView<'_, O>,
+        analysis: &PrefilterAnalysis,
+        verify: Verify,
+        sel: Option<&[u32]>,
+        out: &mut Vec<usize>,
+    ) {
+        let ColumnView {
+            dict,
+            codes,
+            row_offsets,
+        } = view;
+        let num_rows = view.num_rows();
+        if analysis.matches_all {
+            match sel {
+                None => out.extend(0..num_rows),
+                Some(sel) => out.extend(sel.iter().map(|&r| r as usize)),
+            }
+            return;
+        }
+        let walk = (verify == Verify::Walk).then_some(scan::WalkCheck {
+            walk: &analysis.walk,
+            dict,
+            codes,
+        });
+        let check = scan::Check { walk };
+        let input = scan::ScanInput::full(codes, row_offsets, analysis.probe_cover());
+        let plan = scan::plan(input, analysis);
+        match sel {
+            // A selected row costs the per-row scan its codes plus one word of
+            // per-row overhead; the full scan costs every code once.
+            Some(sel) if sel.len() * (codes.len() / num_rows + 64) < codes.len() => {
+                scan::execute(plan, input, check, Some(sel), out);
+            }
+            Some(sel) => {
+                let first = out.len();
+                scan::execute(plan, input, check, None, out);
+                self.keep_selected(num_rows, sel, out, first);
+            }
+            None => scan::execute(plan, input, check, None, out),
+        }
+    }
+
+    /// Drops from `out[first..]` the rows `sel` does not hold, without branches:
+    /// every row is written back, the write position advancing only past a
+    /// selected one.
+    fn keep_selected(&mut self, num_rows: usize, sel: &[u32], out: &mut Vec<usize>, first: usize) {
+        self.selected.clear();
+        self.selected.resize(num_rows, 0);
+        for &r in sel {
+            self.selected[r as usize] = 1;
+        }
+        let mut kept = first;
+        for at in first..out.len() {
+            let row = out[at];
+            out[kept] = row;
+            kept += usize::from(self.selected[row]);
+        }
+        out.truncate(kept);
+    }
+}
+
+/// The longest pattern [`analyze_prefilter`] takes, bounded by the walk's `u16` node ids.
 pub const MAX_PATTERN_LEN: usize = u16::MAX as usize;

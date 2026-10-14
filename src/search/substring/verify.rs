@@ -3,7 +3,7 @@
 
 //! Exact substring verification in the decoded domain.
 //!
-//! [`prefilter_candidates`](super::prefilter_candidates) returns a superset, and
+//! A [`Verify::Superset`](super::Verify::Superset) scan returns a superset, and
 //! something has to check it. One option stays compressed:
 //! [`contains`](super::contains()) steps a token-level KMP automaton over a row's
 //! codes and never decodes. This module is the other one — decode the row, then
@@ -48,7 +48,7 @@ use crate::decoding::DECODE_PADDING;
 ///
 /// ```
 /// use onpair::search::index::build_token_frequency_index;
-/// use onpair::search::{BytesVerifier, analyze_prefilter, prefilter_candidates};
+/// use onpair::search::{BytesVerifier, Finder, Verify, analyze_prefilter};
 /// # use onpair::{Column, DictionaryView, DEFAULT_CONFIG};
 /// # let rows: &[&[u8]] = &[b"alpha", b"beta", b"alphabet"];
 /// # let mut bytes = Vec::new();
@@ -61,7 +61,7 @@ use crate::decoding::DECODE_PADDING;
 /// let mut verifier = BytesVerifier::new(b"pha");
 /// let mut rows = Vec::new();
 /// let analysis = analyze_prefilter(b"pha", view.dict, &freqs, view.num_rows());
-/// prefilter_candidates(view.codes, view.row_offsets, view.dict, &analysis, &mut rows);
+/// Finder::new().find(view, &analysis, Verify::Superset, None, &mut rows);
 /// verifier.retain(view, &mut rows);
 /// assert_eq!(rows, vec![0, 2]);
 /// ```
@@ -98,8 +98,8 @@ impl<'p> BytesVerifier<'p> {
     /// Drop from `rows` every row that does not contain the pattern, keeping the
     /// rest in place and in order.
     ///
-    /// Intended for the candidate list [`prefilter_candidates`](super::prefilter_candidates)
-    /// appended to: filtering happens in place, so verification adds no allocation
+    /// Intended for the candidate list a [`Verify::Superset`](super::Verify::Superset)
+    /// scan appended to: filtering happens in place, so verification adds no allocation
     /// of its own beyond the decode buffer.
     ///
     /// # Panics

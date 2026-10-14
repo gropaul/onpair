@@ -37,12 +37,11 @@
 //!   index for a code stream.
 //! * [`analyze_prefilter`] — derive a normalized probe cover and report its
 //!   frequency.
-//! * [`prefilter_candidates`] — the rows containing a pattern, collected by
-//!   running a probe cover over the code stream. Every hit is verified against
-//!   the alignment graph in the compressed domain, so the rows are exact and
-//!   nothing verifies behind it.
-//! * [`prefilter_superset`] — the same scan without the walk: a sound superset
-//!   of the rows, for a caller that verifies them itself.
+//! * [`Finder::find`] — the rows containing a pattern, of every row or of a
+//!   selection, collected by running a probe cover over the code stream. Under
+//!   [`Verify::Walk`] every hit is verified against the alignment graph in the
+//!   compressed domain, so the rows are exact and nothing verifies behind it;
+//!   [`Verify::Superset`] skips the walk for a caller that verifies itself.
 //! * [`BytesVerifier`] — an exact check in the decoded domain: decode a row
 //!   into a reused buffer and `memmem` it. What the prefilter is measured
 //!   against, and the substring check without a pattern-length cap.
@@ -59,9 +58,8 @@ pub use equals::equals;
 pub use lookup::prefix_range;
 pub use prefix::{PrefixQuery, starts_with};
 pub use substring::{
-    BytesVerifier, ContainsTable, MAX_PATTERN_LEN, PrefilterAnalysis, PrefilterHit, PrefilterTrace,
-    ProbeCover, TraceEdge, TraceLabel, analyze_prefilter, contains, prefilter_candidates,
-    prefilter_hits, prefilter_is_likely_profitable, prefilter_superset, prefilter_walk_hits,
-    trace_prefilter,
+    Anchor, AnchoredWalk, BytesVerifier, ContainsTable, Finder, MAX_PATTERN_LEN, PrefilterAnalysis,
+    PrefilterHit, PrefilterTrace, ProbeCover, TraceEdge, TraceLabel, Verify, analyze_prefilter,
+    contains, prefilter_hits, prefilter_is_likely_profitable, prefilter_walk_hits, trace_prefilter,
 };
 pub use tokenize::tokenize;

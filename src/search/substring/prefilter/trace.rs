@@ -3,7 +3,7 @@
 
 //! The planner's alignment graph and chosen cut, for logging and figures.
 
-use super::graph::{ProbeSet, build_alignment_graph};
+use super::graph::{Anchor, ProbeSet, build_alignment_graph};
 use super::plan::cheapest_cover;
 use super::scan::{Region, Walk};
 use super::{MAX_PATTERN_LEN, PrefilterAnalysis};
@@ -61,7 +61,7 @@ pub fn trace_prefilter<S: TokenFrequencyIndexStorage>(
 ) -> PrefilterTrace {
     assert!(!pattern.is_empty() && pattern.len() <= MAX_PATTERN_LEN);
     let frequencies_view = frequencies.as_view();
-    let graph = build_alignment_graph(dict, pattern, frequencies_view);
+    let graph = build_alignment_graph(dict, pattern, Some(frequencies_view), Anchor::Anywhere);
     let region = Region {
         code_count: frequencies.total_frequency() as usize,
         row_count,

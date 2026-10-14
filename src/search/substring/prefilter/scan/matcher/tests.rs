@@ -5,23 +5,38 @@
 
 use super::{Block, Mask, Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::{EqOr, Range};
+use super::{EqOr, EqOrK, EqOrKPoints, EqOrPoints, Range};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::prefilter::ProbeCover;
 use crate::search::substring::prefilter::scan::policy::{Match, Shape, takes};
-use crate::search::substring::prefilter::scan::{BLOCK, Check, both_stages, resolver};
+use crate::search::substring::prefilter::scan::{BLOCK, Check, WORDS, resolver, scan};
 
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
-    let mut bits = [0u64; BLOCK / 64];
+    let matcher = M::new(cover);
+    let mut bits = [0u64; WORDS];
     // A cleared flag promises an empty mask. The other way round is allowed:
     // a kernel that packs regardless never asked the question.
-    let any_hit = M::new(cover).check(codes, &mut bits);
+    let any_hit = matcher.check(codes, &mut bits);
     assert!(
         any_hit || bits.iter().all(|&set| set == 0),
         "a set bit under a cleared empty-block flag"
     );
+    // As the per-row scan reads it: `n` codes from every 16-aligned start
+    // that leaves 64 codes readable.
+    for start in (0..=BLOCK - 64).step_by(16) {
+        let block: &[Token; 64] = codes[start..start + 64].try_into().unwrap();
+        for n in 1..=64 {
+            let row = matcher.check_row(block, n);
+            for code in 0..n {
+                let at = start + code;
+                let want = bits[at / 64] >> (at % 64) & 1;
+                let got = row >> code & 1;
+                assert_eq!(got, want, "code {at} differs as a row of {n} from {start}");
+            }
+        }
+    }
     bits
 }
 
@@ -29,7 +44,7 @@ fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
 /// One code at a time, straight off `ProbeCover::contains`, so a kernel is checked
 /// against the contract and never against a sibling.
 fn expected(cover: &ProbeCover, codes: &Block) -> Mask {
-    let mut bits = [0u64; BLOCK / 64];
+    let mut bits = [0u64; WORDS];
     for (at, &code) in codes.iter().enumerate() {
         if cover.contains(code) {
             bits[at / 64] |= 1 << (at % 64);
@@ -68,6 +83,25 @@ fn every_matcher(cover: &ProbeCover, codes: &Block) {
     {
         agrees::<EqOr<false>>(Match::EqOr, "eq_or", cover, codes);
         agrees::<EqOr<true>>(Match::EqOr, "eq_or_skip_empty", cover, codes);
+        if cover.ranges().is_empty() {
+            agrees::<EqOrPoints<false>>(Match::EqOr, "eq_or_points", cover, codes);
+            agrees::<EqOrPoints<true>>(Match::EqOr, "eq_or_points_skip_empty", cover, codes);
+        }
+        match cover.points().len() {
+            1 => agrees::<EqOrK<1>>(Match::EqOr, "eq_or_k1", cover, codes),
+            2 => agrees::<EqOrK<2>>(Match::EqOr, "eq_or_k2", cover, codes),
+            3 => agrees::<EqOrK<3>>(Match::EqOr, "eq_or_k3", cover, codes),
+            8 => agrees::<EqOrK<8>>(Match::EqOr, "eq_or_k8", cover, codes),
+            _ => {}
+        }
+        if cover.ranges().is_empty() {
+            match cover.points().len() {
+                1 => agrees::<EqOrKPoints<1>>(Match::EqOr, "eq_or_k1_points", cover, codes),
+                2 => agrees::<EqOrKPoints<2>>(Match::EqOr, "eq_or_k2_points", cover, codes),
+                8 => agrees::<EqOrKPoints<8>>(Match::EqOr, "eq_or_k8_points", cover, codes),
+                _ => {}
+            }
+        }
         agrees::<Range<false>>(Match::Range, "range", cover, codes);
         agrees::<Range<true>>(Match::Range, "range_skip_empty", cover, codes);
         // At the batch count the dispatch compiles for K.
@@ -355,11 +389,11 @@ fn the_driver_scans_every_block() {
     let at = 2 * BLOCK + 40;
     let cover = ProbeCover::new(codes[at..at + 1].to_vec(), vec![]);
     let mut found = Vec::new();
-    both_stages::<Table, resolver::LinearSeek<'_, u32>>(
+    scan::<Table, resolver::LinearSeek<'_, u32>>(
         &cover,
         &codes,
         &row_offsets,
-        Check::Superset,
+        Check::SUPERSET,
         &mut found,
     );
     assert_eq!(found, vec![at / 64]);
@@ -367,11 +401,11 @@ fn the_driver_scans_every_block() {
     // The same layer at the wide offset width.
     let wide: Vec<u64> = row_offsets.iter().map(|&o| u64::from(o)).collect();
     found.clear();
-    both_stages::<Table, resolver::GallopSeek<'_, u64>>(
+    scan::<Table, resolver::GallopSeek<'_, u64>>(
         &cover,
         &codes,
         &wide,
-        Check::Superset,
+        Check::SUPERSET,
         &mut found,
     );
     assert_eq!(found, vec![at / 64]);
@@ -386,11 +420,11 @@ fn padding_makes_no_candidate() {
         let codes: Vec<Token> = (0..length).map(|at| (at % 255 + 1) as Token).collect();
         let row_offsets = vec![0, length as u32];
         let mut found = Vec::new();
-        both_stages::<Table, resolver::LinearSeek<'_, u32>>(
+        scan::<Table, resolver::LinearSeek<'_, u32>>(
             &ProbeCover::new(vec![0 as Token], vec![]),
             &codes,
             &row_offsets,
-            Check::Superset,
+            Check::SUPERSET,
             &mut found,
         );
         assert!(found.is_empty(), "over {length} codes: {found:?}");

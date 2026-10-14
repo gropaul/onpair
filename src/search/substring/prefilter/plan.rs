@@ -16,7 +16,7 @@
 //! frequency would be unsound. Profitability remains a caller decision.
 
 use super::cover::ProbeCover;
-use super::graph::{AlignmentGraph, Edge, build_alignment_graph};
+use super::graph::{AlignmentGraph, Anchor, Edge, build_alignment_graph};
 use super::mincut::MinCut;
 use super::scan::Walk;
 use super::scan::{Region, scan_ns};
@@ -42,7 +42,7 @@ pub(super) fn plan(
     frequencies: TokenFrequencyIndexView<'_>,
     row_count: usize,
 ) -> Planned {
-    let graph = build_alignment_graph(dict, pattern, frequencies);
+    let graph = build_alignment_graph(dict, pattern, Some(frequencies), Anchor::Anywhere);
     let region = Region {
         code_count: frequencies.total_frequency() as usize,
         row_count,

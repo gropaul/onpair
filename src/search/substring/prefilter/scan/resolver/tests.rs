@@ -4,7 +4,7 @@
 //! Every resolver against [`expected_rows`], on the same masks and layers.
 
 use super::{GallopSeek, LinearSeek, Mask, Resolver, expected_rows};
-use crate::search::substring::prefilter::scan::{BLOCK, Check};
+use crate::search::substring::prefilter::scan::{BLOCK, Check, WORDS};
 
 /// Blocks per case: enough that a row can span one whole block and still
 /// start and end inside the stream.
@@ -16,10 +16,10 @@ const CODES: usize = BLOCKS * BLOCK;
 fn resolve<'a, R: Resolver<'a>>(mask: &[u64], row_offsets: &'a [R::Offset]) -> Vec<usize> {
     let mut out = Vec::new();
     let mut resolver = R::new(row_offsets);
-    for (block, bits) in mask.chunks_exact(BLOCK / 64).enumerate() {
+    for (block, bits) in mask.chunks_exact(WORDS).enumerate() {
         let bits: &Mask = bits.try_into().unwrap();
         if bits.iter().any(|&set| set != 0) {
-            resolver.rows(bits, block * BLOCK, Check::Superset, &mut out);
+            resolver.rows(bits, block * BLOCK, Check::SUPERSET, &mut out);
         }
     }
     out
@@ -141,7 +141,12 @@ fn agree_on_every_density() {
 /// row, on either side of a block boundary.
 #[test]
 fn agree_on_a_row_hit_in_two_blocks() {
-    let row_offsets = vec![0, (BLOCK / 4) as u32, (BLOCK + BLOCK / 2) as u32, CODES as u32];
+    let row_offsets = vec![
+        0,
+        (BLOCK / 4) as u32,
+        (BLOCK + BLOCK / 2) as u32,
+        CODES as u32,
+    ];
     for pair in [
         [BLOCK - 1, BLOCK],
         [BLOCK - 1, BLOCK + BLOCK / 2 - 1],

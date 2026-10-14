@@ -23,11 +23,11 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::super::matcher::{EqOr, Range};
-use super::super::matcher::{Matcher, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use super::super::matcher::{NibbleN8, PER_BATCH};
+use super::super::matcher::{EqOrPoints, NibbleN8, PER_BATCH};
+use super::super::matcher::{Matcher, Table};
 use super::super::policy::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
-use super::super::{BLOCK, Check, Isa, both_stages, resolver};
+use super::super::{BLOCK, Check, Isa, resolver, scan};
 use super::loader::{
     NeedleSet, SAMPLE, STREAMS, WIDE, check_codes, code, codes as sweep_codes, load_corpus,
     load_needles, paths, row_layer,
@@ -234,11 +234,11 @@ fn time<M: Matcher>(
     let mut bits = [0u64; BLOCK / 64];
     let seconds = best(&mut || mask_stream(&matcher, codes, &mut bits));
     let mut found = Vec::new();
-    both_stages::<M, resolver::LinearSeek<'_, u32>>(
+    scan::<M, resolver::LinearSeek<'_, u32>>(
         &cover,
         checked,
         check_rows,
-        Check::Superset,
+        Check::SUPERSET,
         &mut found,
     );
     Some((seconds, found))
@@ -284,13 +284,41 @@ fn nibble_n8k<const SKIP: bool>(name: &'static str) -> Kernel {
     }
 }
 
+/// `EqOr` as the dispatch runs it: without the range loop when the cover
+/// has no range.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn eq_or<const SKIP: bool>(name: &'static str) -> Kernel {
+    fn run_eq_or<const SKIP: bool>(
+        kind: Match,
+        probe: &Probe<'_>,
+        codes: &[Token],
+        checked: &[Token],
+        check_rows: &[u32],
+    ) -> Option<(f64, Vec<usize>)> {
+        let cover = probe.cover();
+        if !takes(kind, Shape::of(&cover)) {
+            return None;
+        }
+        if cover.ranges().is_empty() {
+            time::<EqOrPoints<SKIP>>(probe, codes, checked, check_rows)
+        } else {
+            time::<EqOr<SKIP>>(probe, codes, checked, check_rows)
+        }
+    }
+    Kernel {
+        name,
+        kind: Match::EqOr,
+        run: run_eq_or::<SKIP>,
+    }
+}
+
 fn kernels() -> Vec<Kernel> {
     #[allow(unused_mut)]
     let mut all = vec![kernel::<Table>(Match::Table, "table")];
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     all.extend([
-        kernel::<EqOr<false>>(Match::EqOr, "eq_or"),
-        kernel::<EqOr<true>>(Match::EqOr, "eq_or_skip"),
+        eq_or::<false>("eq_or"),
+        eq_or::<true>("eq_or_skip"),
         kernel::<Range<false>>(Match::Range, "range"),
         kernel::<Range<true>>(Match::Range, "range_skip"),
         nibble_n8k::<false>("nibble_n8k"),

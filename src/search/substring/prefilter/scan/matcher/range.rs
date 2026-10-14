@@ -9,25 +9,13 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-use super::shared::join;
-#[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "x86_64", not(target_feature = "avx512bw"))
-))]
-use super::shared::narrow;
-use super::shared::{Hits, Vectors, or, words};
-use super::{Block, Mask, Matcher};
+use super::Kernel;
+use super::shared::{Hit, Vector, Vectors, Wide, or, or_wide, pack};
 use crate::core::types::TokenRange;
 use crate::search::substring::prefilter::ProbeCover;
 
 /// `begin` and `last - begin`, each broadcast.
-#[cfg(target_arch = "aarch64")]
-pub(in crate::search::substring::prefilter::scan) type Held = (uint16x8_t, uint16x8_t);
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(in crate::search::substring::prefilter::scan) type Held = (__m256i, __m256i);
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(in crate::search::substring::prefilter::scan) type Held = (__m512i, __m512i);
+pub(in crate::search::substring::prefilter::scan) type Held = (Vector, Vector);
 
 #[cfg(target_arch = "aarch64")]
 pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> Held {
@@ -43,27 +31,20 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 /// Forced inline: left to the inliner, the compare and nibble kernels put the
 /// eight code vectors through the stack once per range, 3.5x what a range
 /// costs here. `inline(always)` and `target_feature` exclude each other, and
-/// neon is baseline on aarch64. `array::map` is spelled out for the same
-/// reason, it lowering to an out-of-line `drain_array_with`.
+/// neon is baseline on aarch64. A loop over a copy, not `array::map`, for the
+/// same reason, it lowering to an out-of-line `drain_array_with`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
-    (lo, width): Held,
-    codes: Vectors,
-) -> Hits {
+unsafe fn inside<const P: usize>((lo, width): Held, codes: Vectors<P>) -> Wide<P> {
     // SAFETY: neon is baseline on aarch64.
     unsafe {
-        let at = |codes| vcleq_u16(vsubq_u16(codes, lo), width);
-        narrow([
-            at(codes[0]),
-            at(codes[1]),
-            at(codes[2]),
-            at(codes[3]),
-            at(codes[4]),
-            at(codes[5]),
-            at(codes[6]),
-            at(codes[7]),
-        ])
+        let mut inside = codes;
+        for p in 0..P {
+            for h in 0..2 {
+                inside[p][h] = vcleq_u16(vsubq_u16(codes[p][h], lo), width);
+            }
+        }
+        inside
     }
 }
 
@@ -82,14 +63,13 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 #[inline]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
-pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
-    (lo, width): Held,
-    codes: Vectors,
-) -> Hits {
-    narrow(codes.map(|codes| {
-        let inside = _mm256_sub_epi16(codes, lo);
-        _mm256_cmpeq_epi16(_mm256_min_epu16(inside, width), inside)
-    }))
+unsafe fn inside<const P: usize>((lo, width): Held, codes: Vectors<P>) -> Wide<P> {
+    codes.map(|pair| {
+        pair.map(|codes| {
+            let inside = _mm256_sub_epi16(codes, lo);
+            _mm256_cmpeq_epi16(_mm256_min_epu16(inside, width), inside)
+        })
+    })
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
@@ -105,23 +85,42 @@ pub(in crate::search::substring::prefilter::scan) fn hold(range: TokenRange) -> 
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 #[target_feature(enable = "avx512f,avx512bw")]
-pub(in crate::search::substring::prefilter::scan) unsafe fn inside(
-    (lo, width): Held,
-    codes: Vectors,
-) -> Hits {
-    let inside = |codes| _mm512_cmple_epu16_mask(_mm512_sub_epi16(codes, lo), width);
-    join(inside(codes[0]), inside(codes[1]))
+unsafe fn inside<const P: usize>((lo, width): Held, codes: Vectors<P>) -> Wide<P> {
+    codes.map(|pair| pair.map(|codes| _mm512_cmple_epu16_mask(_mm512_sub_epi16(codes, lo), width)))
 }
 
+/// `hit` with every range ORed in, before the one `pack`.
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-pub(super) unsafe fn check_ranges(mut hit: Hits, held: &[Held], codes: Vectors) -> Hits {
+pub(super) unsafe fn or_ranges<const P: usize>(
+    mut hit: Wide<P>,
+    held: &[Held],
+    codes: Vectors<P>,
+) -> Wide<P> {
     for &held in held {
         // SAFETY: the set, inherited from this function.
-        hit = unsafe { or(hit, inside(held, codes)) };
+        hit = unsafe { or_wide(hit, inside(held, codes)) };
     }
     hit
+}
+
+/// For a kernel whose hits are bytes already.
+#[inline]
+#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
+pub(super) unsafe fn check_ranges<const P: usize>(
+    hit: [Hit; P],
+    held: &[Held],
+    codes: Vectors<P>,
+) -> [Hit; P] {
+    match held.split_first() {
+        None => hit,
+        // SAFETY: the set, inherited from this function.
+        Some((&first, rest)) => unsafe {
+            or(hit, pack(or_ranges(inside(first, codes), rest, codes)))
+        },
+    }
 }
 
 /// For a cover with no tokens.
@@ -129,27 +128,17 @@ pub(in crate::search::substring::prefilter::scan) struct Range<
     const SKIP_MOVEMASK_IF_NO_MATCH: bool,
 >(Vec<Held>);
 
-impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Matcher for Range<SKIP_MOVEMASK_IF_NO_MATCH> {
+impl<const SKIP_MOVEMASK_IF_NO_MATCH: bool> Kernel for Range<SKIP_MOVEMASK_IF_NO_MATCH> {
+    const SKIP: bool = SKIP_MOVEMASK_IF_NO_MATCH;
+
     fn new(cover: &ProbeCover) -> Self {
         Self(cover.ranges().iter().copied().map(hold).collect())
     }
 
-    fn check(&self, codes: &Block, bits: &mut Mask) -> bool {
-        // SAFETY: `policy::takes` answered for the set.
-        unsafe { mask::<SKIP_MOVEMASK_IF_NO_MATCH>(&self.0, codes, bits) }
+    #[inline(always)]
+    unsafe fn hits<const P: usize>(&self, codes: Vectors<P>) -> [Hit; P] {
+        let (&first, rest) = self.0.split_first().expect("a range, per policy::takes");
+        // SAFETY: the set, the caller's promise.
+        unsafe { pack(or_ranges(inside(first, codes), rest, codes)) }
     }
-}
-
-/// Outside `check` so the closure inherits the target features and inlines.
-#[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-fn mask<const SKIP_MOVEMASK_IF_NO_MATCH: bool>(
-    held: &[Held],
-    codes: &Block,
-    bits: &mut Mask,
-) -> bool {
-    let (&first, rest) = held.split_first().expect("a range, per policy::takes");
-    words::<SKIP_MOVEMASK_IF_NO_MATCH>(codes, bits, |codes| unsafe {
-        check_ranges(inside(first, codes), rest, codes)
-    })
 }
