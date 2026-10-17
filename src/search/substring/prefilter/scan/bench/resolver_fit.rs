@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::super::policy::{Resolve, seek_ns_per_row, stage_two_ns};
-use super::super::{BLOCK, blocks, clear_from, resolver};
+use super::super::{BLOCK_SIZE_SCAN_BLOCKS, blocks, clear_from, resolver};
 use super::loader::{NeedleSet, SAMPLE, load_corpus, load_needles, paths, row_layer};
 use super::utils::{error, file_name, lstsq, read_csv, write_csv};
 use super::{best, machine, resolve_stream};
@@ -103,7 +103,7 @@ impl Row {
     }
 
     fn words(&self) -> f64 {
-        64.0 * self.blocks_hit * self.codes as f64 / BLOCK as f64
+        64.0 * self.blocks_hit * self.codes as f64 / BLOCK_SIZE_SCAN_BLOCKS as f64
     }
 
     fn emitted(&self) -> f64 {
@@ -140,7 +140,7 @@ impl Row {
 fn mask_of(set: &NeedleSet, codes: &[Token]) -> Vec<u64> {
     let cover = ProbeCover::new(set.needles.to_vec(), vec![]);
     let mut mask = Vec::with_capacity(codes.len() / 64);
-    let mut bits = [0u64; BLOCK / 64];
+    let mut bits = [0u64; BLOCK_SIZE_SCAN_BLOCKS / 64];
     blocks(codes, &mut |block, _, valid| {
         bits.fill(0);
         for (at, &code) in block.iter().enumerate() {
@@ -157,7 +157,7 @@ fn mask_of(set: &NeedleSet, codes: &[Token]) -> Vec<u64> {
 /// The blocks a matcher would report non-empty. Finding them is stage
 /// one's work, so it happens once and outside the timed run.
 fn hit_blocks(mask: &[u64]) -> Vec<usize> {
-    mask.chunks_exact(BLOCK / 64)
+    mask.chunks_exact(BLOCK_SIZE_SCAN_BLOCKS / 64)
         .enumerate()
         .filter(|(_, bits)| bits.iter().any(|&set| set != 0))
         .map(|(block, _)| block)
@@ -198,7 +198,8 @@ fn measure(stream: &str, machine: &str, out: &mut Vec<Row>) {
     let (corpus_path, needles_path) = paths(stream, "onpair16");
     let corpus = load_corpus(&corpus_path);
     // Whole blocks only, so the mask is exactly the blocks it holds.
-    let codes = &corpus.codes[..CODES.min(corpus.codes.len()) / BLOCK * BLOCK];
+    let codes = &corpus.codes
+        [..CODES.min(corpus.codes.len()) / BLOCK_SIZE_SCAN_BLOCKS * BLOCK_SIZE_SCAN_BLOCKS];
     let layer = row_layer(&corpus.row_offsets, codes.len());
     let sets: Vec<NeedleSet> = load_needles(&needles_path)
         .into_iter()
@@ -253,7 +254,8 @@ fn measure(stream: &str, machine: &str, out: &mut Vec<Row>) {
                     target: set.target,
                     achieved: set.achieved,
                     density: f64::from(bits) / codes.len() as f64,
-                    blocks_hit: hit.len() as f64 / (mask.len() / (BLOCK / 64)) as f64,
+                    blocks_hit: hit.len() as f64
+                        / (mask.len() / (BLOCK_SIZE_SCAN_BLOCKS / 64)) as f64,
                     selectivity: expected.len() as f64 / rows as f64,
                     gbs: codes.len() as f64 / seconds / 1e9,
                     machine: machine.to_string(),

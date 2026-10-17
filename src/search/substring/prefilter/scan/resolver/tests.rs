@@ -4,12 +4,12 @@
 //! Every resolver against [`expected_rows`], on the same masks and layers.
 
 use super::{GallopSeek, LinearSeek, Mask, Resolver, expected_rows};
-use crate::search::substring::prefilter::scan::{BLOCK, Check, WORDS};
+use crate::search::substring::prefilter::scan::{BLOCK_SIZE_SCAN_BLOCKS, Check, WORDS};
 
 /// Blocks per case: enough that a row can span one whole block and still
 /// start and end inside the stream.
 const BLOCKS: usize = 4;
-const CODES: usize = BLOCKS * BLOCK;
+const CODES: usize = BLOCKS * BLOCK_SIZE_SCAN_BLOCKS;
 
 /// One resolver over a whole mask, block by block, skipping the empty blocks
 /// the matcher's flag would have skipped.
@@ -19,7 +19,12 @@ fn resolve<'a, R: Resolver<'a>>(mask: &[u64], row_offsets: &'a [R::Offset]) -> V
     for (block, bits) in mask.chunks_exact(WORDS).enumerate() {
         let bits: &Mask = bits.try_into().unwrap();
         if bits.iter().any(|&set| set != 0) {
-            resolver.rows(bits, block * BLOCK, Check::SUPERSET, &mut out);
+            resolver.rows(
+                bits,
+                block * BLOCK_SIZE_SCAN_BLOCKS,
+                Check::SUPERSET,
+                &mut out,
+            );
         }
     }
     out
@@ -112,7 +117,17 @@ fn layers() -> Vec<(String, Vec<u32>)> {
         ("ragged".to_string(), ragged()),
         ("one row".to_string(), vec![0, CODES as u32]),
     ];
-    for codes in [1, 3, 8, 64, 65, 1024, BLOCK, BLOCK + 7, 3 * BLOCK] {
+    for codes in [
+        1,
+        3,
+        8,
+        64,
+        65,
+        1024,
+        BLOCK_SIZE_SCAN_BLOCKS,
+        BLOCK_SIZE_SCAN_BLOCKS + 7,
+        3 * BLOCK_SIZE_SCAN_BLOCKS,
+    ] {
         layers.push((format!("{codes} codes per row"), uniform(codes)));
     }
     layers
@@ -127,7 +142,15 @@ fn agree_on_every_density() {
             &vec![u64::MAX; CODES / 64],
             &row_offsets,
         );
-        for stride in [1, 2, 7, 64, 97, BLOCK, 5 * BLOCK / 4] {
+        for stride in [
+            1,
+            2,
+            7,
+            64,
+            97,
+            BLOCK_SIZE_SCAN_BLOCKS,
+            5 * BLOCK_SIZE_SCAN_BLOCKS / 4,
+        ] {
             every_resolver(
                 &format!("{name}, every {stride}th code"),
                 &strided(stride),
@@ -143,14 +166,20 @@ fn agree_on_every_density() {
 fn agree_on_a_row_hit_in_two_blocks() {
     let row_offsets = vec![
         0,
-        (BLOCK / 4) as u32,
-        (BLOCK + BLOCK / 2) as u32,
+        (BLOCK_SIZE_SCAN_BLOCKS / 4) as u32,
+        (BLOCK_SIZE_SCAN_BLOCKS + BLOCK_SIZE_SCAN_BLOCKS / 2) as u32,
         CODES as u32,
     ];
     for pair in [
-        [BLOCK - 1, BLOCK],
-        [BLOCK - 1, BLOCK + BLOCK / 2 - 1],
-        [BLOCK / 4 + BLOCK / 8, BLOCK + BLOCK / 2 - 1],
+        [BLOCK_SIZE_SCAN_BLOCKS - 1, BLOCK_SIZE_SCAN_BLOCKS],
+        [
+            BLOCK_SIZE_SCAN_BLOCKS - 1,
+            BLOCK_SIZE_SCAN_BLOCKS + BLOCK_SIZE_SCAN_BLOCKS / 2 - 1,
+        ],
+        [
+            BLOCK_SIZE_SCAN_BLOCKS / 4 + BLOCK_SIZE_SCAN_BLOCKS / 8,
+            BLOCK_SIZE_SCAN_BLOCKS + BLOCK_SIZE_SCAN_BLOCKS / 2 - 1,
+        ],
     ] {
         let mut mask = empty_mask();
         for code in pair {
@@ -183,7 +212,17 @@ fn agree_on_the_ends_of_the_stream() {
 #[test]
 fn agree_on_one_hit_after_many_rows() {
     let row_offsets = uniform(3);
-    for code in [1, 2, 3, 4, 8, BLOCK - 1, BLOCK, BLOCK + 1, CODES - 2] {
+    for code in [
+        1,
+        2,
+        3,
+        4,
+        8,
+        BLOCK_SIZE_SCAN_BLOCKS - 1,
+        BLOCK_SIZE_SCAN_BLOCKS,
+        BLOCK_SIZE_SCAN_BLOCKS + 1,
+        CODES - 2,
+    ] {
         let mut mask = empty_mask();
         mask[code / 64] |= 1 << (code % 64);
         let rows = expected(&mask, &row_offsets);

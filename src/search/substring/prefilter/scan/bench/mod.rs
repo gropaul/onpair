@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use super::matcher::Matcher;
 use super::resolver::Resolver;
-use super::{BLOCK, Check, Isa, Mask, WORDS, blocks};
+use super::{BLOCK_SIZE_SCAN_BLOCKS, Check, Isa, Mask, WORDS, blocks};
 use crate::core::types::Token;
 
 /// Timed passes per measurement; the fastest is the one to keep.
@@ -89,7 +89,7 @@ fn resolve_stream<'a, R: Resolver<'a>>(
     let mut resolver = R::new(row_offsets);
     for &block in hit {
         let bits: &Mask = mask[block * WORDS..][..WORDS].try_into().unwrap();
-        resolver.rows(bits, block * BLOCK, Check::SUPERSET, out);
+        resolver.rows(bits, block * BLOCK_SIZE_SCAN_BLOCKS, Check::SUPERSET, out);
     }
 }
 

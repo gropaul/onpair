@@ -3,7 +3,7 @@
 
 //! Every matcher against `ProbeCover::contains`.
 
-use super::{Block, Mask, Matcher, Table};
+use super::{Block, Mask, Matcher, RowBlock, Table};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::{EqOr, EqOrK, EqOrKPoints, EqOrPoints, Range};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -11,7 +11,9 @@ use super::{NibbleN8, PER_BATCH};
 use crate::core::types::{Token, TokenRange};
 use crate::search::substring::prefilter::ProbeCover;
 use crate::search::substring::prefilter::scan::policy::{Match, Shape, takes};
-use crate::search::substring::prefilter::scan::{BLOCK, Check, WORDS, resolver, scan};
+use crate::search::substring::prefilter::scan::{
+    BLOCK_SIZE_SCAN_BLOCKS, BLOCK_SIZE_SCAN_ROWS, Check, WORDS, resolver, scan_blocks,
+};
 
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
     let matcher = M::new(cover);
@@ -23,18 +25,18 @@ fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
         any_hit || bits.iter().all(|&set| set == 0),
         "a set bit under a cleared empty-block flag"
     );
-    // As the per-row scan reads it: `n` codes from every 16-aligned start
-    // that leaves 64 codes readable.
-    for start in (0..=BLOCK - 64).step_by(16) {
-        let block: &[Token; 64] = codes[start..start + 64].try_into().unwrap();
-        for n in 1..=64 {
-            let row = matcher.check_row(block, n);
-            for code in 0..n {
-                let at = start + code;
-                let want = bits[at / 64] >> (at % 64) & 1;
-                let got = row >> code & 1;
-                assert_eq!(got, want, "code {at} differs as a row of {n} from {start}");
-            }
+    // As the per-row scan reads it: the first `n` codes of a block from every
+    // 16-aligned start.
+    for start in (0..=BLOCK_SIZE_SCAN_BLOCKS - BLOCK_SIZE_SCAN_ROWS).step_by(16) {
+        let block: &RowBlock = codes[start..start + BLOCK_SIZE_SCAN_ROWS]
+            .try_into()
+            .unwrap();
+        for n in 1..=BLOCK_SIZE_SCAN_ROWS {
+            let got: Vec<usize> = matcher.step(block, n).collect();
+            let want: Vec<usize> = (0..n)
+                .filter(|code| bits[(start + code) / 64] >> ((start + code) % 64) & 1 == 1)
+                .collect();
+            assert_eq!(got, want, "a row of {n} from {start}");
         }
     }
     bits
@@ -69,7 +71,7 @@ fn agrees<M: Matcher>(kind: Match, name: &str, cover: &ProbeCover, codes: &Block
 /// A block whose codes are all distinct: 37 is invertible modulo 50021, so
 /// no value repeats over a block and a needle has exactly one hit.
 fn block() -> Block {
-    let mut codes = [0 as Token; BLOCK];
+    let mut codes = [0 as Token; BLOCK_SIZE_SCAN_BLOCKS];
     for (at, code) in codes.iter_mut().enumerate() {
         *code = (at * 37 % 50021) as Token;
     }
@@ -158,7 +160,9 @@ fn every_matcher_ranged(cover: ProbeCover, lo: Token, hi: Token, codes: &Block) 
 fn agree_on_needles_the_block_holds() {
     let codes = block();
     for count in [1, 2, 3, 8, 9, 12, 16, 17, 24, 64] {
-        let needles: Vec<Token> = (0..count).map(|k| codes[k * (BLOCK / 64)]).collect();
+        let needles: Vec<Token> = (0..count)
+            .map(|k| codes[k * (BLOCK_SIZE_SCAN_BLOCKS / 64)])
+            .collect();
         let cover = ProbeCover::new(needles.to_vec(), vec![]);
         assert_eq!(
             expected(&cover, &codes)
@@ -184,11 +188,11 @@ fn agree_on_needles_the_block_does_not_hold() {
 /// the mask covers rather than anything the lookahead reaches.
 #[test]
 fn agree_on_a_hit_at_the_seam() {
-    let mut codes = [7 as Token; BLOCK];
-    codes[BLOCK - 1] = 60000;
+    let mut codes = [7 as Token; BLOCK_SIZE_SCAN_BLOCKS];
+    codes[BLOCK_SIZE_SCAN_BLOCKS - 1] = 60000;
     let cover = ProbeCover::new(vec![60000], vec![]);
     assert_eq!(
-        expected(&cover, &codes)[BLOCK / 64 - 1],
+        expected(&cover, &codes)[BLOCK_SIZE_SCAN_BLOCKS / 64 - 1],
         1 << 63,
         "the definition missed the seam hit"
     );
@@ -199,8 +203,8 @@ fn agree_on_a_hit_at_the_seam() {
 /// must not be confused for each other.
 #[test]
 fn agree_on_codes_sharing_a_low_byte() {
-    let mut codes = [0x0102 as Token; BLOCK];
-    let at = BLOCK - 58;
+    let mut codes = [0x0102 as Token; BLOCK_SIZE_SCAN_BLOCKS];
+    let at = BLOCK_SIZE_SCAN_BLOCKS - 58;
     codes[at] = 0x0202;
     let cover = ProbeCover::new(vec![0x0202], vec![]);
     assert_eq!(
@@ -271,7 +275,7 @@ fn agree_on_ranges_of_wide_codes() {
 /// put 0x8000 below 0x7fff; the kernels must not.
 #[test]
 fn agree_on_the_sign_boundary() {
-    let mut codes = [0 as Token; BLOCK];
+    let mut codes = [0 as Token; BLOCK_SIZE_SCAN_BLOCKS];
     for (at, code) in codes.iter_mut().enumerate() {
         *code = [0x7ffe, 0x7fff, 0x8000, 0x8001, 0x8002, 7][at % 6];
     }
@@ -319,7 +323,7 @@ fn agree_on_the_sign_boundary() {
 /// width arithmetic must not wrap.
 #[test]
 fn agree_at_the_top_of_the_code_space() {
-    let mut codes = [0 as Token; BLOCK];
+    let mut codes = [0 as Token; BLOCK_SIZE_SCAN_BLOCKS];
     for (at, code) in codes.iter_mut().enumerate() {
         *code = [65527, 65531, 65532, 65533, 65534, Token::MAX, 7][at % 7];
     }
@@ -344,7 +348,7 @@ fn agree_at_the_top_of_the_code_space() {
 /// range setting one end.
 #[test]
 fn table_rejects_the_codes_around_its_own() {
-    let mut codes = [0 as Token; BLOCK];
+    let mut codes = [0 as Token; BLOCK_SIZE_SCAN_BLOCKS];
     for (at, code) in codes.iter_mut().enumerate() {
         *code = [999, 1000, 3000, 3001, 0, Token::MAX][at % 6];
     }
@@ -366,7 +370,7 @@ fn table_rejects_the_codes_around_its_own() {
 #[test]
 fn the_table_masks_one_code() {
     let codes = block();
-    let at = BLOCK - 28;
+    let at = BLOCK_SIZE_SCAN_BLOCKS - 28;
     let bits = mask::<Table>(&ProbeCover::new(codes[at..at + 1].to_vec(), vec![]), &codes);
     assert_eq!(bits[at / 64] >> (at % 64) & 1, 1, "missed the code");
     assert_eq!(
@@ -382,14 +386,14 @@ fn the_table_masks_one_code() {
 fn the_driver_scans_every_block() {
     // Two and a bit blocks, so both the whole-block and the padded tail path
     // run, with the planted hit inside the tail.
-    let codes: Vec<Token> = (0..2 * BLOCK + 100)
+    let codes: Vec<Token> = (0..2 * BLOCK_SIZE_SCAN_BLOCKS + 100)
         .map(|at| (at * 37 % 50021) as Token)
         .collect();
     let row_offsets: Vec<u32> = (0..=codes.len() as u32).step_by(64).collect();
-    let at = 2 * BLOCK + 40;
+    let at = 2 * BLOCK_SIZE_SCAN_BLOCKS + 40;
     let cover = ProbeCover::new(codes[at..at + 1].to_vec(), vec![]);
     let mut found = Vec::new();
-    scan::<Table, resolver::LinearSeek<'_, u32>>(
+    scan_blocks::<Table, resolver::LinearSeek<'_, u32>>(
         &cover,
         &codes,
         &row_offsets,
@@ -401,7 +405,7 @@ fn the_driver_scans_every_block() {
     // The same layer at the wide offset width.
     let wide: Vec<u64> = row_offsets.iter().map(|&o| u64::from(o)).collect();
     found.clear();
-    scan::<Table, resolver::GallopSeek<'_, u64>>(
+    scan_blocks::<Table, resolver::GallopSeek<'_, u64>>(
         &cover,
         &codes,
         &wide,
@@ -415,12 +419,21 @@ fn the_driver_scans_every_block() {
 /// reach a resolver, whatever the stream length leaves in the last block.
 #[test]
 fn padding_makes_no_candidate() {
-    for length in [1, 2, 3, 5, BLOCK, BLOCK + 1, BLOCK + 2, BLOCK + 3] {
+    for length in [
+        1,
+        2,
+        3,
+        5,
+        BLOCK_SIZE_SCAN_BLOCKS,
+        BLOCK_SIZE_SCAN_BLOCKS + 1,
+        BLOCK_SIZE_SCAN_BLOCKS + 2,
+        BLOCK_SIZE_SCAN_BLOCKS + 3,
+    ] {
         // No zero in the stream, so every zero a token matches is padding.
         let codes: Vec<Token> = (0..length).map(|at| (at % 255 + 1) as Token).collect();
         let row_offsets = vec![0, length as u32];
         let mut found = Vec::new();
-        scan::<Table, resolver::LinearSeek<'_, u32>>(
+        scan_blocks::<Table, resolver::LinearSeek<'_, u32>>(
             &ProbeCover::new(vec![0 as Token], vec![]),
             &codes,
             &row_offsets,

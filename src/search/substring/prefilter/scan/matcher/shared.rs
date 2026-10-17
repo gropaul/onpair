@@ -5,7 +5,7 @@
 //! vectors: a pair's compares pack into one [`Hit`], 0xFF/0x00 byte lanes on
 //! NEON and AVX2 and a mask word on AVX-512, which a build selects with
 //! `-C target-feature=+avx512bw` or `-C target-cpu=native`. A mask word is
-//! [`PAIRS`] pairs, and [`block`] and [`row`] are a [`Kernel`] as a
+//! [`PAIRS`] pairs, and [`block`] and [`step`] are a [`Kernel`] as a
 //! [`Matcher`](super::Matcher).
 
 #[cfg(target_arch = "aarch64")]
@@ -13,7 +13,7 @@ use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use super::{Block, Kernel, Mask};
+use super::{Block, Kernel, Mask, RowBlock, StepHits};
 use crate::core::types::Token;
 
 /// Eight codes.
@@ -26,7 +26,7 @@ pub(super) type Compare = uint16x8_t;
 #[cfg(target_arch = "aarch64")]
 pub(super) type Hit = uint8x16_t;
 #[cfg(target_arch = "aarch64")]
-pub(super) const PAIRS: usize = 4;
+pub(in crate::search::substring::prefilter::scan) const PAIRS: usize = 4;
 
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 pub(super) type Vector = __m256i;
@@ -35,7 +35,7 @@ pub(super) type Compare = __m256i;
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 pub(super) type Hit = __m256i;
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
-pub(super) const PAIRS: usize = 2;
+pub(in crate::search::substring::prefilter::scan) const PAIRS: usize = 2;
 
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 pub(super) type Vector = __m512i;
@@ -44,7 +44,7 @@ pub(super) type Compare = __mmask32;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
 pub(super) type Hit = u64;
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(super) const PAIRS: usize = 1;
+pub(in crate::search::substring::prefilter::scan) const PAIRS: usize = 1;
 
 /// `P` pairs of code vectors; a block's 64 codes at [`PAIRS`].
 pub(super) type Vectors<const P: usize> = [[Vector; 2]; P];
@@ -87,13 +87,36 @@ pub(super) fn block<K: Kernel>(kernel: &K, codes: &Block, bits: &mut Mask) -> bo
     written
 }
 
-/// The per-row step: 64 codes, one word.
+/// One block of the per-row scan: a single pair of code vectors.
 #[inline]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
 #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx2"))]
-pub(super) fn row<K: Kernel>(kernel: &K, codes: &[Token; 64]) -> u64 {
-    // SAFETY: 64 codes are readable; the set, inherited from this function.
-    row_word(unsafe { kernel.hits(load(codes.as_ptr())) })
+pub(super) fn step<K: Kernel>(kernel: &K, codes: &RowBlock) -> StepHits {
+    // SAFETY: a pair's codes are the block; the set, inherited from this function.
+    let [hit] = unsafe { kernel.hits::<1>(load(codes.as_ptr())) };
+    step_hits(hit)
+}
+
+/// `shrn` keeps a nibble of each byte: four bits per code, no movemask.
+#[inline]
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+fn step_hits(hit: Hit) -> StepHits {
+    let nibbles = vshrn_n_u16::<4>(vreinterpretq_u16_u8(hit));
+    StepHits::nibbles(vget_lane_u64::<0>(vreinterpret_u64_u8(nibbles)))
+}
+
+#[inline]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
+#[target_feature(enable = "avx2")]
+fn step_hits(hit: Hit) -> StepHits {
+    StepHits::bits(u64::from(_mm256_movemask_epi8(hit) as u32))
+}
+
+#[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+fn step_hits(hit: Hit) -> StepHits {
+    StepHits::bits(hit)
 }
 
 /// `P` pairs of code vectors from `at`.
@@ -170,15 +193,6 @@ unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
     unsafe { vst1q_u64(bits.as_mut_ptr(), vreinterpretq_u64_u8(lanes)) };
 }
 
-/// Code `i`'s hit at bit `i`, all 64.
-#[inline]
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-pub(super) fn row_word(hit: Hits) -> u64 {
-    let lanes = nibbles(hit);
-    vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(lanes, lanes)))
-}
-
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn load<const P: usize>(at: *const Token) -> Vectors<P> {
@@ -239,7 +253,7 @@ unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
 #[inline]
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
 #[target_feature(enable = "avx2")]
-pub(super) fn row_word(hit: Hits) -> u64 {
+fn row_word(hit: Hits) -> u64 {
     let lo = _mm256_movemask_epi8(hit[0]) as u32;
     let hi = _mm256_movemask_epi8(hit[1]) as u32;
     u64::from(lo) | u64::from(hi) << 32
@@ -291,6 +305,6 @@ unsafe fn movemask(bits: &mut [u64], a: Hits, b: Hits) {
 /// Code `i`'s hit at bit `i`, all 64.
 #[inline]
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-pub(super) fn row_word(hit: Hits) -> u64 {
+fn row_word(hit: Hits) -> u64 {
     hit[0]
 }

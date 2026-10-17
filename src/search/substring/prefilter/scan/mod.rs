@@ -167,7 +167,13 @@ pub(super) fn scan_scalar<O: Offset>(
 /// Mask words per block.
 pub(in crate::search::substring::prefilter) const WORDS: usize = 8;
 /// Codes per block. Kernels rely on the multiple of 128.
-pub(in crate::search::substring::prefilter) const BLOCK: usize = 64 * WORDS;
+pub(in crate::search::substring::prefilter) const BLOCK_SIZE_SCAN_BLOCKS: usize = 64 * WORDS;
+/// Codes per block of the per-row scan: one pair of code vectors, the SIMD
+/// width, so a short row costs one kernel call.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(in crate::search::substring::prefilter) const BLOCK_SIZE_SCAN_ROWS: usize = 64 / matcher::PAIRS;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub(in crate::search::substring::prefilter) const BLOCK_SIZE_SCAN_ROWS: usize = 64;
 
 /// The instruction set this build's kernels run on. The other thing a cost
 /// is per: the same kernel is a different cost on each, since what a range
@@ -199,9 +205,11 @@ impl Isa {
 }
 
 /// One block of codes, exactly what a matcher is handed.
-type Block = [Token; BLOCK];
+type Block = [Token; BLOCK_SIZE_SCAN_BLOCKS];
 /// One block of mask, bit `i` for code `i` of the block.
 type Mask = [u64; WORDS];
+/// One block of the per-row scan.
+type RowBlock = [Token; BLOCK_SIZE_SCAN_ROWS];
 
 /// What stage two asks of a hit before its row goes out.
 #[derive(Clone, Copy)]
@@ -233,7 +241,7 @@ impl Check<'_> {
 }
 
 /// Both stages over a whole stream. Rows come out ascending and unique.
-fn scan<'a, M: Matcher, R: Resolver<'a>>(
+fn scan_blocks<'a, M: Matcher, R: Resolver<'a>>(
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &'a [R::Offset],
@@ -258,21 +266,25 @@ fn scan<'a, M: Matcher, R: Resolver<'a>>(
 /// stream's; bits past `valid` are the padding's and must go.
 fn blocks(codes: &[Token], step: &mut dyn FnMut(&Block, usize, usize)) {
     let mut at = 0;
-    while at + BLOCK <= codes.len() {
-        step(codes[at..at + BLOCK].try_into().unwrap(), at, BLOCK);
-        at += BLOCK;
+    while at + BLOCK_SIZE_SCAN_BLOCKS <= codes.len() {
+        step(
+            codes[at..at + BLOCK_SIZE_SCAN_BLOCKS].try_into().unwrap(),
+            at,
+            BLOCK_SIZE_SCAN_BLOCKS,
+        );
+        at += BLOCK_SIZE_SCAN_BLOCKS;
     }
     if at < codes.len() {
         let rest = codes.len() - at;
-        let mut tail = [Token::default(); BLOCK];
+        let mut tail = [Token::default(); BLOCK_SIZE_SCAN_BLOCKS];
         tail[..rest].copy_from_slice(&codes[at..]);
         step(&tail, at, rest);
     }
 }
 
-/// The matcher over each row of `sel` from its first code, a word at a time,
-/// reading 64 codes that run past the row's end: the bits past it are
-/// cleared, and every other hit is the row's own, so no resolver is asked.
+/// The matcher over each row of `sel` from its first code, a
+/// [`RowBlock`] at a time that runs past the row's end: the hits past it are
+/// dropped, and every other hit is the row's own, so no resolver is asked.
 /// The row goes out on its first hit that passes `check`, and the rest of it
 /// is never read. `sel` is ascending row indices below the row count.
 fn scan_rows<M: Matcher, O: Offset>(
@@ -284,43 +296,73 @@ fn scan_rows<M: Matcher, O: Offset>(
     out: &mut Vec<usize>,
 ) {
     let matcher = M::new(cover);
-    // The stream's last 63 codes, read through a copy; what lies past the
-    // row is masked off, so the copy's stale rest does no harm.
-    let mut tail = [Token::default(); 64];
+    // Rows whose blocks all lie inside the stream read it in place; the few
+    // at its end read a copy padded by a block.
+    let inside = sel.partition_point(|&r| {
+        row_offsets[r as usize + 1].to_usize() + BLOCK_SIZE_SCAN_ROWS <= codes.len()
+    });
+    // SAFETY: the partition's promise.
+    unsafe { rows(&matcher, codes, 0, row_offsets, &sel[..inside], check, out) };
+    if let Some(&first) = sel.get(inside) {
+        let base = row_offsets[first as usize].to_usize();
+        let mut padded = codes[base..].to_vec();
+        padded.resize(padded.len() + BLOCK_SIZE_SCAN_ROWS, Token::default());
+        // SAFETY: the padding covers the last block of every row.
+        unsafe {
+            rows(
+                &matcher,
+                &padded,
+                base,
+                row_offsets,
+                &sel[inside..],
+                check,
+                out,
+            )
+        };
+    }
+}
+
+/// [`scan_rows`] over rows `sel`, with `codes` the stream from index `base`
+/// on, a block at least of which lies at and past every row's start.
+/// One block per pass, the check at its end, so a short row loops once.
+///
+/// # Safety
+/// For every row of `sel`, `codes` holds a block from each of its block
+/// starts, and from its start when it is empty.
+#[inline(always)]
+unsafe fn rows<M: Matcher, O: Offset>(
+    matcher: &M,
+    codes: &[Token],
+    base: usize,
+    row_offsets: &[O],
+    sel: &[u32],
+    check: Check<'_>,
+    out: &mut Vec<usize>,
+) {
     'rows: for &r in sel {
         let r = r as usize;
         let (start, end) = (row_offsets[r].to_usize(), row_offsets[r + 1].to_usize());
         let mut at = start;
-        while at < end {
-            let rest = &codes[at..];
-            let block = match rest.first_chunk::<64>() {
-                Some(block) => block,
-                None => {
-                    tail[..rest.len()].copy_from_slice(rest);
-                    &tail
-                }
-            };
-            let n = (end - at).min(64);
-            let mut set = matcher.check_row(block, n);
-            if n < 64 {
-                set &= (1 << n) - 1;
-            }
-            while set != 0 {
-                let code = at + set.trailing_zeros() as usize;
-                if check.passes(code, start, end) {
+        loop {
+            // SAFETY: the caller's promise.
+            let block = unsafe { &*codes.as_ptr().add(at - base).cast::<RowBlock>() };
+            for offset in matcher.step(block, end - at) {
+                if check.passes(at + offset, start, end) {
                     out.push(r);
                     continue 'rows;
                 }
-                set &= set - 1;
             }
-            at += 64;
+            at += BLOCK_SIZE_SCAN_ROWS;
+            if at >= end {
+                break;
+            }
         }
     }
 }
 
 /// Clears the bits from position `valid` on.
 fn clear_from(bits: &mut Mask, valid: usize) {
-    if valid < BLOCK {
+    if valid < BLOCK_SIZE_SCAN_BLOCKS {
         bits[valid / 64] &= (1u64 << (valid % 64)) - 1;
         bits[valid / 64 + 1..].fill(0);
     }

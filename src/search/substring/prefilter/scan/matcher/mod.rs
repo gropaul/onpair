@@ -15,8 +15,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 
-use super::{Block, Mask};
-use crate::core::types::Token;
+use super::{Block, Mask, RowBlock};
 use crate::search::substring::prefilter::ProbeCover;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -29,6 +28,8 @@ pub(in crate::search::substring::prefilter::scan) use nibble_n8::{
 };
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(in crate::search::substring::prefilter::scan) use range::Range;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(in crate::search::substring::prefilter::scan) use shared::PAIRS;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(in crate::search::substring::prefilter::scan) use shared::available as simd_available;
 pub(in crate::search::substring::prefilter::scan) use table::Table;
@@ -44,9 +45,61 @@ pub(in crate::search::substring::prefilter::scan) trait Matcher:
     /// is skipped; `true` promises nothing.
     fn check(&self, codes: &Block, bits: &mut Mask) -> bool;
 
-    /// Bit `i` for each of the first `n <= 64` of `codes`; the bits past
-    /// code `n` are unspecified.
-    fn check_row(&self, codes: &[Token; 64], n: usize) -> u64;
+    /// The hits among the first `n` codes of one block of the per-row scan;
+    /// `n` may run past the block.
+    fn step(&self, codes: &RowBlock, n: usize) -> StepHits;
+}
+
+/// The hits of one [`RowBlock`] as code offsets, ascending. On NEON a code
+/// is four bits of the word, `uzp1` and `shrn` without a movemask; on x86 it
+/// is one, and only this type knows which.
+#[derive(Clone, Copy)]
+pub(in crate::search::substring::prefilter::scan) struct StepHits {
+    word: u64,
+    /// log2 of the bits per code.
+    shift: u32,
+}
+
+impl StepHits {
+    /// Four bits per code, all four set on a hit.
+    #[cfg(target_arch = "aarch64")]
+    fn nibbles(word: u64) -> Self {
+        Self {
+            word: word & 0x1111_1111_1111_1111,
+            shift: 2,
+        }
+    }
+
+    /// One bit per code.
+    fn bits(word: u64) -> Self {
+        Self { word, shift: 0 }
+    }
+
+    /// Drops the codes from `n` on: the block ran past the row's end.
+    fn keep(self, n: usize) -> Self {
+        let bits = n << self.shift;
+        Self {
+            word: if bits < 64 {
+                self.word & ((1 << bits) - 1)
+            } else {
+                self.word
+            },
+            ..self
+        }
+    }
+}
+
+impl Iterator for StepHits {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        (self.word != 0).then(|| {
+            let at = self.word.trailing_zeros() >> self.shift;
+            self.word &= self.word - 1;
+            at as usize
+        })
+    }
 }
 
 /// A vector kernel: the compare alone, over any number of pairs of code
@@ -80,8 +133,9 @@ impl<K: Kernel> Matcher for K {
         unsafe { shared::block(self, codes, bits) }
     }
 
-    fn check_row(&self, codes: &[Token; 64], _n: usize) -> u64 {
+    #[inline]
+    fn step(&self, codes: &RowBlock, n: usize) -> StepHits {
         // SAFETY: `policy::takes` answered for the set.
-        unsafe { shared::row(self, codes) }
+        unsafe { shared::step(self, codes) }.keep(n)
     }
 }

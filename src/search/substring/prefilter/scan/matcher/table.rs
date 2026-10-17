@@ -3,8 +3,7 @@
 
 //! One table byte per u16 code, one load per code. L = 1, any K, any R, scalar.
 
-use super::{Block, Mask, Matcher};
-use crate::core::types::Token;
+use super::{Block, Mask, Matcher, RowBlock, StepHits};
 use crate::search::substring::prefilter::ProbeCover;
 
 pub(in crate::search::substring::prefilter::scan) struct Table {
@@ -44,15 +43,15 @@ impl Matcher for Table {
         any != 0
     }
 
-    /// One load per code of the row only, so the step is the most a word holds.
     #[inline]
-    fn check_row(&self, codes: &[Token; 64], n: usize) -> u64 {
+    /// One load per code of the row only.
+    fn step(&self, codes: &RowBlock, n: usize) -> StepHits {
         let mut word = 0u64;
-        for (bit, &code) in codes[..n].iter().enumerate() {
+        for (bit, &code) in codes[..n.min(codes.len())].iter().enumerate() {
             // SAFETY: the table has an entry for every u16.
             let admits = unsafe { *self.admits.get_unchecked(usize::from(code)) };
             word |= u64::from(admits & 1) << bit;
         }
-        word
+        StepHits::bits(word)
     }
 }

@@ -17,7 +17,7 @@ use super::super::cover::ProbeCover;
 use super::matcher::simd_available;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::matcher::{MAX_BATCHES, PER_BATCH};
-use super::{BLOCK, Isa};
+use super::{BLOCK_SIZE_SCAN_BLOCKS, Isa};
 
 /// What the planner reads about the region. No code values are inspected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -355,7 +355,7 @@ pub(in crate::search::substring::prefilter) fn scan_ns(
     let stage_one = codes * stage_one_ns_per_code(shape, covered / codes);
 
     let emitted = hit_rows(covered, rows);
-    let blocks_hit = 1.0 - (-covered / codes * BLOCK as f64).exp();
+    let blocks_hit = 1.0 - (-covered / codes * BLOCK_SIZE_SCAN_BLOCKS as f64).exp();
     let words = codes / 64.0 * blocks_hit;
     let stage_two = [Resolve::LinearSeek, Resolve::GallopSeek]
         .into_iter()
