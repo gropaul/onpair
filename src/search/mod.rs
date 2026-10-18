@@ -60,6 +60,6 @@ pub use prefix::{PrefixQuery, starts_with};
 pub use substring::{
     Anchor, AnchoredWalk, BytesVerifier, ContainsTable, Finder, MAX_PATTERN_LEN, PrefilterAnalysis,
     PrefilterHit, PrefilterTrace, ProbeCover, TraceEdge, TraceLabel, Verify, analyze_prefilter,
-    contains, prefilter_hits, prefilter_is_likely_profitable, prefilter_walk_hits, trace_prefilter,
+    contains, prefilter_hits, prefilter_walk_hits, trace_prefilter,
 };
 pub use tokenize::tokenize;

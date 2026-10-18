@@ -103,40 +103,6 @@ pub(super) fn slope(point: &[(f64, f64)]) -> f64 {
     if swxx.abs() < 1e-12 { 0.0 } else { swxy / swxx }
 }
 
-/// Least squares of `y ≈ Σ βᵢ·xᵢ` on relative error: every row is scaled by
-/// its own `y`, so each measurement counts the same. Normal equations, solved
-/// by elimination.
-pub(super) fn lstsq<const N: usize>(row: &[([f64; N], f64)]) -> [f64; N] {
-    let mut a = [[0.0; N]; N];
-    let mut b = [0.0; N];
-    for (x, y) in row {
-        for i in 0..N {
-            b[i] += x[i] / y;
-            for j in 0..N {
-                a[i][j] += x[i] * x[j] / (y * y);
-            }
-        }
-    }
-    for col in 0..N {
-        let pivot = (col..N)
-            .max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))
-            .unwrap();
-        a.swap(col, pivot);
-        b.swap(col, pivot);
-        if a[col][col] == 0.0 {
-            continue;
-        }
-        for i in (0..N).filter(|&i| i != col) {
-            let f = a[i][col] / a[col][col];
-            for j in 0..N {
-                a[i][j] -= f * a[col][j];
-            }
-            b[i] -= f * b[col];
-        }
-    }
-    std::array::from_fn(|i| if a[i][i] == 0.0 { 0.0 } else { b[i] / a[i][i] })
-}
-
 /// Mean relative error of `pred` over the points, in percent.
 pub(super) fn error(point: &[(f64, f64)], pred: impl Fn(f64) -> f64) -> f64 {
     if point.is_empty() {

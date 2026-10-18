@@ -13,11 +13,11 @@
 //! `bench::fit` to the sweeps in `bench`.
 
 use super::super::cover::ProbeCover;
+use super::Isa;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::matcher::simd_available;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::matcher::{MAX_BATCHES, PER_BATCH};
-use super::{BLOCK_SIZE_SCAN_BLOCKS, Isa};
 
 /// What the planner reads about the region. No code values are inspected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +53,7 @@ impl Shape {
 /// batched bitmap run on all three vector sets; the byte table is scalar and
 /// runs anywhere.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Match {
+pub(in crate::search::substring::prefilter) enum Match {
     /// One byte per code of the whole code space. Takes every cover, so it
     /// is what a target with no vector kernel runs, and where the ladder ends
     /// on one that has them.
@@ -83,7 +83,7 @@ pub(super) const BYTES_PER_CODE: f64 = 2.0;
 pub(super) fn select(cover: &ProbeCover, facts: Facts) -> Plan {
     Plan {
         matcher: select_matcher(Shape::of(cover)),
-        skip: skip_ns_per_code(density(facts)) < 0.0,
+        skip: density(facts) < SKIP_BELOW_DENSITY,
     }
 }
 
@@ -96,33 +96,18 @@ fn density(facts: Facts) -> f64 {
     }
 }
 
-/// Codes one pass of the pack covers, which is the two mask words
-/// [`words`](super::matcher) writes at a time and the unit the flag decides
-/// over.
-const PACK_GROUP: f64 = 128.0;
-
-/// What `SKIP_MOVEMASK_IF_NO_MATCH` adds, in ns per code: the lane OR it pays on
-/// every group, less the pack it saves on the groups with no match. Both are
-/// fitted to the two ends of the sweep and land on their instruction counts.
-/// Negative is worth taking. See `README.md`.
-fn skip_ns_per_code(density: f64) -> f64 {
-    /// The lane OR and its cross-domain read, then the pack and its store,
-    /// both ns per group and both fitted to the two ends of the sweep.
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
-    const COST: (f64, f64) = (0.75, 1.01);
-    /// On AVX-512 the compare has already written the mask word, so there is
-    /// no pack to skip and the test is a `ktest`: the flag can only cost.
-    /// The 2026-09-08 sweep measured it positive at every selectivity, from
-    /// 0.0007 ns per code on a stream nothing hits to 0.030 where the branch
-    /// stops predicting, against nothing saved.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
-    const COST: (f64, f64) = (0.35, 0.0);
-    let (reduction, pack) = COST;
-    // The share of groups with no match, if the hits fall evenly. They
-    // cluster, so the break-even is an order and not a point.
-    let no_match = (-PACK_GROUP * density).exp();
-    (reduction - pack * no_match) / PACK_GROUP
-}
+/// Hit density below which `SKIP_MOVEMASK_IF_NO_MATCH` pays. The flag adds a
+/// lane OR on every group of 128 codes, 0.75 ns, and saves the pack, 1.01 ns,
+/// on each group with no match, an `exp(-128 · density)` share if the hits
+/// fall evenly: break-even at `ln(1.01 / 0.75) / 128`. Hits cluster, so this is
+/// an order and not a point. See `README.md`.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+const SKIP_BELOW_DENSITY: f64 = 0.0023;
+/// On AVX-512 the compare has already written the mask word, so there is no
+/// pack to skip and the flag can only cost: the 2026-09-08 sweep measured it
+/// positive at every selectivity.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+const SKIP_BELOW_DENSITY: f64 = 0.0;
 
 /// The cheapest kernel [`ns_per_code`] models that [`takes`] the cover.
 /// See `README.md`.
@@ -162,28 +147,12 @@ pub(super) fn takes(kernel: Match, shape: Shape) -> bool {
     }
 }
 
-/// What the planned matcher costs per code at this hit density: the kernel
-/// [`select_matcher`] picks plus the pack-skipping flag where it pays. The
-/// scalar kernels have no pack to skip.
-pub(in crate::search::substring::prefilter) fn stage_one_ns_per_code(
-    shape: Shape,
-    density: f64,
-) -> f64 {
-    let matcher = select_matcher(shape);
-    let skip = match matcher {
-        Match::Table => 0.0,
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        _ => skip_ns_per_code(density).min(0.0),
-    };
-    ns_per_code(matcher, shape) + skip
-}
-
 /// Nanoseconds per code, one function per instruction set, because the same
 /// kernel is a different cost on each: a range costs AVX-512 half what it
 /// costs NEON, and a bitmap batch half again. Each is `bench::fit` on that
 /// set's own sweep, and each is a table, so `README.md` reads as its rows.
 /// The dispatch folds away, [`Isa::BUILT`] being a const.
-pub(super) fn ns_per_code(matcher: Match, shape: Shape) -> f64 {
+pub(in crate::search::substring::prefilter) fn ns_per_code(matcher: Match, shape: Shape) -> f64 {
     match Isa::BUILT {
         #[cfg(target_arch = "aarch64")]
         Isa::Neon => neon(matcher, shape),
@@ -264,31 +233,7 @@ fn scalar(matcher: Match, shape: Shape) -> f64 {
 /// averaged: the median of 57 needles over three columns at two dictionary
 /// widths in the `prefilter_walk_*.csv` runs, each above the subtraction's
 /// jitter floor, spread 2.6 to 30 ns.
-const WALK_NS_PER_HIT: f64 = 8.0;
-
-/// Stage two: one mask word read in a block that hit, one halving of the
-/// gallop. Fitted on aarch64 Apple M4 Pro, from
-/// novel_resolve_2026-10-14_17-39-10.csv, by `bench::resolver_fit`, within
-/// 34% of its rows.
-const WORD_NS: f64 = 0.04;
-const GALLOP_SEEK_STEP_NS: f64 = 1.92;
-
-/// Stage two over `words` mask words in blocks that hit, emitting `emitted`
-/// rows with `crossed` rows searched past on the way: log2 of the rows
-/// crossed per emitted row, per emitted row.
-pub(super) fn stage_two_ns(words: f64, emitted: f64, crossed: f64) -> f64 {
-    if emitted <= 0.0 {
-        return WORD_NS * words;
-    }
-    WORD_NS * words + emitted * GALLOP_SEEK_STEP_NS * (1.0 + crossed / emitted).log2()
-}
-
-/// Rows the mask is expected to name: a row of `x` expected hits holds one
-/// with probability `1 - exp(-x)`, which the resolver sweep measured to hold
-/// within 20%.
-fn hit_rows(expected_hits: f64, rows: f64) -> f64 {
-    rows * (1.0 - (-expected_hits / rows).exp())
-}
+pub(in crate::search::substring::prefilter) const VERIFY_NS_PER_HIT: f64 = 8.0;
 
 /// The stream a cover would be scanned over.
 #[derive(Clone, Copy, Debug)]
@@ -299,8 +244,9 @@ pub(in crate::search::substring::prefilter) struct Region {
 
 /// Expected nanoseconds to scan `cover` over `region` and walk every hit,
 /// given the `covered` codes it matches there: stage one at the kernel the
-/// shape gets, stage two, the walk per hit. An empty
-/// cover proves no row matches and costs nothing.
+/// shape gets and the walk per hit. Stage two, the resolve, is under 3% of
+/// either and left out. An empty cover proves no row matches and costs
+/// nothing.
 pub(in crate::search::substring::prefilter) fn scan_ns(
     cover: &ProbeCover,
     covered: u32,
@@ -310,20 +256,13 @@ pub(in crate::search::substring::prefilter) fn scan_ns(
         return 0.0;
     }
     let codes = region.code_count as f64;
-    let rows = region.row_count as f64;
     let covered = f64::from(covered);
     let shape = Shape {
         tokens: cover.points().len(),
         ranges: cover.ranges().len(),
     };
-    let stage_one = codes * stage_one_ns_per_code(shape, covered / codes);
-
-    let emitted = hit_rows(covered, rows);
-    let blocks_hit = 1.0 - (-covered / codes * BLOCK_SIZE_SCAN_BLOCKS as f64).exp();
-    let words = codes / 64.0 * blocks_hit;
-    let stage_two = stage_two_ns(words, emitted, rows);
-
-    stage_one + stage_two + covered * WALK_NS_PER_HIT
+    let stage_one = codes * ns_per_code(select_matcher(shape), shape);
+    stage_one + covered * VERIFY_NS_PER_HIT
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

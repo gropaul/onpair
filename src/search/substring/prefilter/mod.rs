@@ -72,15 +72,6 @@ impl PrefilterAnalysis {
         self.total_frequency
     }
 
-    /// SIMD comparisons per vector: one per point, two per range.
-    pub fn comparison_cost(&self) -> usize {
-        let cover = self.probe_cover();
-        cover
-            .points()
-            .len()
-            .saturating_add(cover.ranges().len().saturating_mul(2))
-    }
-
     /// Expected share of `row_count` rows holding a covered code, an over-estimate
     /// when rows hold several.
     pub fn expected_candidate_row_fraction(&self, row_count: usize) -> f64 {
@@ -92,20 +83,6 @@ impl PrefilterAnalysis {
         }
         (f64::from(self.covered_frequency) / row_count as f64).min(1.0)
     }
-}
-
-/// Widest cover the SIMD kernels serve before a generic loop takes over.
-const MAX_SIMD_COMPARISONS: usize = 16;
-
-/// Largest share of rows the default policy sends to per-row verification.
-const MAX_CANDIDATE_ROW_FRACTION: f64 = 0.10;
-
-/// Whether prefiltering `row_count` rows is expected to beat bulk decoding, a hint
-/// calibrated on AArch64 against decode plus `memmem`.
-pub fn prefilter_is_likely_profitable(analysis: &PrefilterAnalysis, row_count: usize) -> bool {
-    analysis.matches_all
-        || (analysis.comparison_cost() <= MAX_SIMD_COMPARISONS
-            && analysis.expected_candidate_row_fraction(row_count) < MAX_CANDIDATE_ROW_FRACTION)
 }
 
 /// The sound probe cover the cost model prices lowest for `pattern` over `row_count` rows.
@@ -135,15 +112,7 @@ pub fn analyze_prefilter<S: TokenFrequencyIndexStorage>(
         "pattern of {} bytes exceeds the prefilter's {MAX_PATTERN_LEN}",
         pattern.len()
     );
-    let planned = plan::plan(dict, pattern, frequencies.as_view(), row_count);
-    PrefilterAnalysis {
-        probe_cover: planned.cover,
-        covered_frequency: planned.covered,
-        total_frequency: frequencies.total_frequency(),
-        scan_ns: planned.scan_ns,
-        walk: planned.walk,
-        matches_all: false,
-    }
+    plan::plan(dict, pattern, frequencies.as_view(), row_count).2
 }
 
 /// A pattern prepared for the rows that start or end with it. The row fixes

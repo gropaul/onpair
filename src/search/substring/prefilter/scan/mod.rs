@@ -23,7 +23,9 @@ mod resolver;
 mod walk;
 
 use matcher::Matcher;
-pub(in crate::search::substring::prefilter) use policy::{Facts, Region, scan_ns};
+pub(in crate::search::substring::prefilter) use policy::{
+    Facts, Match, Region, Shape, VERIFY_NS_PER_HIT, ns_per_code, scan_ns,
+};
 use resolver::GallopSeek;
 pub(in crate::search::substring::prefilter) use walk::Walk;
 

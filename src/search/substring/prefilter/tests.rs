@@ -11,10 +11,7 @@ use super::graph::{
 use super::mincut::min_cut;
 use super::plan::{cheapest_cover, cover_frequency};
 use super::scan::{Region, scan_ns};
-use super::{
-    AnchoredWalk, Finder, PrefilterAnalysis, Verify, analyze_prefilter,
-    prefilter_is_likely_profitable,
-};
+use super::{AnchoredWalk, Finder, PrefilterAnalysis, Verify, analyze_prefilter};
 use crate::core::dictionary::{CompactDictionaryView, DictionaryView};
 use crate::core::types::{MAX_TOKEN_SIZE, Token, TokenRange};
 use crate::search::index::{
@@ -250,7 +247,10 @@ fn check_graph(
 
     // A cut has to block the DAG on its own and still catch every matching
     // row, whatever it was weighted by.
-    let cut = min_cut(&graph.edges, graph.nodes, probe_weight);
+    let cut: Vec<&Edge> = min_cut(&graph.edges, graph.nodes, probe_weight)
+        .iter()
+        .map(|&at| &graph.edges[at as usize])
+        .collect();
     assert!(
         !sink_reachable_avoiding(&graph, |edge| selected(&cut, edge)),
         "the minimum cut leaves a source-to-sink path open for {pat:?}"
@@ -430,7 +430,6 @@ fn empty_pattern_appends_all_rows() {
         let frequencies = build_token_frequency_index(view.codes, view.dict.num_tokens()).unwrap();
         let analysis = analyze_prefilter(b"", view.dict, &frequencies, view.num_rows());
         assert!(analysis.probe_cover().is_empty());
-        assert_eq!(analysis.comparison_cost(), 0);
         assert_eq!(analysis.covered_frequency(), 0);
         assert_eq!(analysis.covered_fraction(), 0.0);
         assert_eq!(analysis.expected_scan_ns(), 0.0);
@@ -439,7 +438,6 @@ fn empty_pattern_appends_all_rows() {
             analysis.expected_candidate_row_fraction(view.num_rows()),
             if rows.is_empty() { 0.0 } else { 1.0 }
         );
-        assert!(prefilter_is_likely_profitable(&analysis, view.num_rows()));
 
         let expected: Vec<_> = (0..rows.len()).collect();
         let mut got = vec![usize::MAX];
@@ -466,7 +464,6 @@ fn empty_probe_cover_still_appends_nothing() {
         matches_all: false,
     };
     assert_eq!(analysis.expected_candidate_row_fraction(3), 0.0);
-    assert!(prefilter_is_likely_profitable(&analysis, 3));
 
     let dict = crate::compress(b"a", &[0u32, 1], DEFAULT_CONFIG).unwrap();
     let mut rows = vec![usize::MAX];
@@ -858,9 +855,12 @@ fn sweep_prices_at_or_below_the_frequency_cut() {
         b"https://www.example.com",
     ] {
         let graph = build_alignment_graph(view.dict, pat, Some(freq), Anchor::Anywhere);
-        let by_frequency = min_cut(&graph.edges, graph.nodes, |edge| {
+        let by_frequency: Vec<&Edge> = min_cut(&graph.edges, graph.nodes, |edge| {
             u64::from(edge.frequency())
-        });
+        })
+        .iter()
+        .map(|&at| &graph.edges[at as usize])
+        .collect();
         let baseline = ProbeCover::from_edge_cut(&by_frequency);
         let baseline_ns = scan_ns(&baseline, cover_frequency(&baseline, freq), region);
 

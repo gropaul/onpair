@@ -48,10 +48,7 @@ struct Dinic {
     /// Current-arc cursor: the first arc of each node not yet ruled out this
     /// phase. Never rewinds, which is what bounds the blocking flow.
     next: Vec<u32>,
-    /// Forward arc of each edge, in edge order, so a re-solve refills
-    /// capacities without rebuilding the CSR.
-    forward: Vec<u32>,
-    /// The BFS frontier, held across solves rather than allocated per phase.
+    /// The BFS frontier, held across phases rather than allocated per phase.
     queue: VecDeque<usize>,
     /// The advancing DFS path, as the arcs taken to reach the current node.
     path: Vec<u32>,
@@ -60,9 +57,9 @@ struct Dinic {
 impl Dinic {
     /// Build the residual graph over `num_nodes` nodes from `arcs`, each
     /// `(from, to, capacity)`. Every arc gets a zero-capacity twin.
-    fn new(num_nodes: usize, arcs: &[(u32, u32)]) -> Self {
+    fn new(num_nodes: usize, arcs: &[(u32, u32, u64)]) -> Self {
         let mut head = vec![0u32; num_nodes + 1];
-        for &(from, to) in arcs {
+        for &(from, to, _) in arcs {
             head[from as usize + 1] += 1;
             head[to as usize + 1] += 1;
         }
@@ -74,8 +71,8 @@ impl Dinic {
         let mut cursor = head.clone();
         let mut edge_to = vec![0u32; slots];
         let mut twin = vec![0u32; slots];
-        let mut forward = vec![0u32; arcs.len()];
-        for (at, &(from, to)) in arcs.iter().enumerate() {
+        let mut cap = vec![0u64; slots];
+        for &(from, to, capacity) in arcs {
             let fwd = cursor[from as usize];
             cursor[from as usize] += 1;
             let rev = cursor[to as usize];
@@ -84,28 +81,18 @@ impl Dinic {
             twin[fwd as usize] = rev;
             edge_to[rev as usize] = from;
             twin[rev as usize] = fwd;
-            forward[at] = fwd;
+            cap[fwd as usize] = capacity;
         }
 
         Self {
             head,
             to: edge_to,
             twin,
-            cap: vec![0u64; slots],
+            cap,
             level: vec![-1; num_nodes],
             next: vec![0; num_nodes],
-            forward,
             queue: VecDeque::new(),
             path: Vec::new(),
-        }
-    }
-
-    /// Reset the residual to `capacities`, one per edge in edge order. The
-    /// topology is a property of the graph, not of the weights, so it survives.
-    fn refill(&mut self, capacities: impl Iterator<Item = u64>) {
-        self.cap.fill(0);
-        for (at, capacity) in capacities.enumerate() {
-            self.cap[self.forward[at] as usize] = capacity;
         }
     }
 
@@ -204,94 +191,62 @@ impl Dinic {
     }
 }
 
-/// A minimum-cut solver bound to one graph, re-solvable at new weights.
+/// The cheapest set of cuttable edges whose removal disconnects the source
+/// from the sink, as ascending indices into `edges`. `weight` prices cutting
+/// one edge and is consulted for cuttable edges only.
 ///
-/// The residual topology is a property of the graph and the weights are not, so
-/// a sweep that re-prices the same DAG rebuilds nothing: capacities are refilled
-/// in place and the cut lands in a buffer the solver owns. That matters because
-/// the graph is tiny — a handful of live nodes — so building it cost about what
-/// solving it does.
-pub(super) struct MinCut {
-    flow: Dinic,
-    nodes: Nodes,
-    /// The cut of the last solve, as indices into the caller's edge slice.
-    cut: Vec<u32>,
-}
-
-impl MinCut {
-    pub(super) fn new(edges: &[Edge], nodes: Nodes) -> Self {
-        debug_assert!(
-            edges.len() * 2 <= u32::MAX as usize,
-            "the residual graph outgrew u32 arc ids"
-        );
-        let arcs: Vec<(u32, u32)> = edges.iter().map(|edge| (edge.from, edge.to)).collect();
-        Self {
-            flow: Dinic::new(nodes.count(), &arcs),
-            nodes,
-            cut: Vec::new(),
-        }
-    }
-
-    /// The cheapest set of cuttable edges whose removal disconnects the source
-    /// from the sink, as ascending indices into `edges`. `weight` prices cutting
-    /// one edge and is consulted for cuttable edges only.
-    ///
-    /// # Panics
-    /// Panics if some source-to-sink path runs entirely through uncuttable
-    /// edges, which no cut can block. Returning a set that fails to disconnect
-    /// them would hand back an unsound cover instead.
-    pub(super) fn solve(&mut self, edges: &[Edge], weight: impl Fn(&Edge) -> u64) -> &[u32] {
-        // One more than every finite cut, so a minimum cut never prefers an
-        // uncuttable step over the edges that stand for real probes.
-        let finite_sum = edges
-            .iter()
-            .filter(|edge| edge.cuttable())
-            .try_fold(0u64, |acc, edge| acc.checked_add(weight(edge)))
-            .expect("sum of probe weights overflowed u64");
-        let infinite = finite_sum + 1;
-        self.flow.refill(edges.iter().map(|edge| {
-            if edge.cuttable() {
+/// # Panics
+/// Panics if some source-to-sink path runs entirely through uncuttable
+/// edges, which no cut can block. Returning a set that fails to disconnect
+/// them would hand back an unsound cover instead.
+pub(super) fn min_cut(edges: &[Edge], nodes: Nodes, weight: impl Fn(&Edge) -> u64) -> Vec<u32> {
+    debug_assert!(
+        edges.len() * 2 <= u32::MAX as usize,
+        "the residual graph outgrew u32 arc ids"
+    );
+    // One more than every finite cut, so a minimum cut never prefers an
+    // uncuttable step over the edges that stand for real probes.
+    let finite_sum = edges
+        .iter()
+        .filter(|edge| edge.cuttable())
+        .try_fold(0u64, |acc, edge| acc.checked_add(weight(edge)))
+        .expect("sum of probe weights overflowed u64");
+    let infinite = finite_sum + 1;
+    let arcs: Vec<(u32, u32, u64)> = edges
+        .iter()
+        .map(|edge| {
+            let capacity = if edge.cuttable() {
                 weight(edge)
             } else {
                 infinite
-            }
-        }));
+            };
+            (edge.from, edge.to, capacity)
+        })
+        .collect();
+    let mut flow = Dinic::new(nodes.count(), &arcs);
 
-        let (source, sink) = (self.nodes.source() as usize, self.nodes.sink() as usize);
-        let value = self.flow.max_flow(source, sink);
-        assert!(
-            value < infinite,
-            "the alignment DAG has a source-to-sink path with no probe on it"
-        );
+    let (source, sink) = (nodes.source() as usize, nodes.sink() as usize);
+    let value = flow.max_flow(source, sink);
+    assert!(
+        value < infinite,
+        "the alignment DAG has a source-to-sink path with no probe on it"
+    );
 
-        // `max_flow` stops on the level pass that failed to reach the sink, and
-        // that pass is exactly a BFS of the residual graph from the source — so
-        // `level` already marks the source side, and no second traversal is
-        // needed. An edge is cut when it straddles the two sides, which also
-        // means it is saturated: an unsaturated edge would have carried the BFS
-        // across.
-        self.cut.clear();
-        self.cut
-            .extend(edges.iter().enumerate().filter_map(|(at, edge)| {
-                (edge.cuttable()
-                    && self.flow.level[edge.from as usize] >= 0
-                    && self.flow.level[edge.to as usize] < 0)
-                    .then_some(at as u32)
-            }));
-        &self.cut
-    }
-}
-
-/// One cut of `edges` at `weight`, building a solver to do it. The planner
-/// prices the same graph many times and uses [`MinCut::solve`] directly; this
-/// is for callers that cut once.
-#[cfg(test)]
-pub(super) fn min_cut(edges: &[Edge], nodes: Nodes, weight: impl Fn(&Edge) -> u64) -> Vec<&Edge> {
-    let mut solver = MinCut::new(edges, nodes);
-    solver
-        .solve(edges, weight)
+    // `max_flow` stops on the level pass that failed to reach the sink, and
+    // that pass is exactly a BFS of the residual graph from the source — so
+    // `level` already marks the source side, and no second traversal is
+    // needed. An edge is cut when it straddles the two sides, which also
+    // means it is saturated: an unsaturated edge would have carried the BFS
+    // across.
+    edges
         .iter()
-        .map(|&at| &edges[at as usize])
+        .enumerate()
+        .filter_map(|(at, edge)| {
+            (edge.cuttable()
+                && flow.level[edge.from as usize] >= 0
+                && flow.level[edge.to as usize] < 0)
+                .then_some(at as u32)
+        })
         .collect()
 }
 
@@ -306,8 +261,10 @@ mod tests {
         u64::from(edge.frequency())
     }
 
-    fn steps(cut: &[&Edge]) -> Vec<(u32, u32)> {
-        cut.iter().map(|edge| (edge.from, edge.to)).collect()
+    fn steps(edges: &[Edge], cut: &[u32]) -> Vec<(u32, u32)> {
+        cut.iter()
+            .map(|&at| (edges[at as usize].from, edges[at as usize].to))
+            .collect()
     }
 
     /// The property the merged DAG exists for: two alignments converging on one
@@ -323,7 +280,7 @@ mod tests {
             Edge::synthetic(3, 4, Some(6)),
         ];
         assert_eq!(
-            steps(&min_cut(&edges, Nodes::new(4), by_frequency)),
+            steps(&edges, &min_cut(&edges, Nodes::new(4), by_frequency)),
             vec![(3, 4)]
         );
     }
@@ -341,7 +298,7 @@ mod tests {
             Edge::synthetic(3, 4, Some(0)),
         ];
         assert_eq!(
-            steps(&min_cut(&edges, Nodes::new(4), by_frequency)),
+            steps(&edges, &min_cut(&edges, Nodes::new(4), by_frequency)),
             vec![(1, 4), (3, 4)]
         );
     }
@@ -359,7 +316,10 @@ mod tests {
         edges[cheapest as usize] = Edge::synthetic(cheapest, cheapest + 1, Some(3));
 
         assert_eq!(
-            steps(&min_cut(&edges, Nodes::new(LEN as usize - 1), by_frequency)),
+            steps(
+                &edges,
+                &min_cut(&edges, Nodes::new(LEN as usize - 1), by_frequency)
+            ),
             vec![(cheapest, cheapest + 1)]
         );
     }

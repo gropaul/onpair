@@ -18,6 +18,6 @@ pub use contains::{ContainsTable, contains};
 pub use prefilter::{
     Anchor, AnchoredWalk, Finder, MAX_PATTERN_LEN, PrefilterAnalysis, PrefilterHit, PrefilterTrace,
     ProbeCover, TraceEdge, TraceLabel, Verify, analyze_prefilter, prefilter_hits,
-    prefilter_is_likely_profitable, prefilter_walk_hits, trace_prefilter,
+    prefilter_walk_hits, trace_prefilter,
 };
 pub use verify::BytesVerifier;

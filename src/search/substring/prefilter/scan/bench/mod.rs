@@ -5,17 +5,14 @@
 //! the constants in `policy`.
 //!
 //! ```text
-//! cargo test --release --lib scan::bench::matcher_fit::sweep  -- --ignored --nocapture
-//! cargo test --release --lib scan::bench::resolver_fit::sweep -- --ignored --nocapture
+//! cargo test --release --lib scan::bench::matcher_fit::sweep -- --ignored --nocapture
 //! ```
 //!
 //! [`matcher_fit`] is stage one, a matcher against the probe shapes a cover
-//! arrives in. [`resolver_fit`] is stage two, the resolver against one mask per
-//! needle set, so what is timed is the mask-to-rows half alone. Each `sweep`
-//! writes one timestamped CSV to `bench/output/`, which the marimo dashboards
-//! out of tree read, then fits the model to its rows and prints the
-//! block to paste into `policy`; each `refit` does the same from the newest
-//! CSV, or the one `MASK_CSV` or `RESOLVE_CSV` names, so a constant is a
+//! arrives in. Its `sweep` writes one timestamped CSV to `bench/output/`,
+//! which the marimo dashboards out of tree read, then fits the model to its
+//! rows and prints the block to paste into `policy`; its `refit` does the
+//! same from the newest CSV, or the one `MASK_CSV` names, so a constant is a
 //! measurement and not a memory.
 //!
 //! A u16 code weighs two bytes, so `gbs` and `gcodes` part company on the
@@ -25,16 +22,12 @@
 mod loader;
 #[cfg(test)]
 mod matcher_fit;
-#[cfg(test)]
-mod resolver_fit;
 mod utils;
 
 use std::time::Instant;
 
 use super::matcher::Matcher;
-use super::resolver::GallopSeek;
-use super::{BLOCK_SIZE_SCAN_BLOCKS, Check, Isa, Mask, WORDS, blocks};
-use crate::core::offset::Offset;
+use super::{Isa, Mask, blocks};
 use crate::core::types::Token;
 
 /// Timed passes per measurement; the fastest is the one to keep.
@@ -74,19 +67,6 @@ fn mask_stream<M: Matcher>(matcher: &M, codes: &[Token], bits: &mut Mask) {
     blocks(codes, &mut |block, _, _| {
         matcher.check(block, bits);
     });
-}
-
-/// Stage two over a whole stream, from a mask built once: the blocks a
-/// matcher would report non-empty, in order, into a buffer the passes reuse.
-/// Clearing that buffer and appending to it is the resolver's own cost and is
-/// timed with it.
-fn resolve_stream<O: Offset>(mask: &[u64], hit: &[usize], row_offsets: &[O], out: &mut Vec<usize>) {
-    out.clear();
-    let mut resolver = GallopSeek::new(row_offsets);
-    for &block in hit {
-        let bits: &Mask = mask[block * WORDS..][..WORDS].try_into().unwrap();
-        resolver.rows(bits, block * BLOCK_SIZE_SCAN_BLOCKS, Check::SUPERSET, out);
-    }
 }
 
 /// Machine identity for the CSV: architecture and CPU model, commas stripped.
