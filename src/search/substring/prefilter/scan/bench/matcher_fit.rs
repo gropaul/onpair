@@ -27,7 +27,7 @@ use super::super::matcher::{EqOr, Range};
 use super::super::matcher::{EqOrPoints, NibbleN8, PER_BATCH};
 use super::super::matcher::{Matcher, Table};
 use super::super::policy::{BYTES_PER_CODE, Match, Shape, ns_per_code, takes};
-use super::super::{BLOCK_SIZE_SCAN_BLOCKS, Check, Isa, resolver, scan_blocks};
+use super::super::{BLOCK_SIZE_SCAN_BLOCKS, Check, Isa, scan_blocks};
 use super::loader::{
     NeedleSet, SAMPLE, STREAMS, WIDE, check_codes, code, codes as sweep_codes, load_corpus,
     load_needles, paths, row_layer,
@@ -234,13 +234,7 @@ fn time<M: Matcher>(
     let mut bits = [0u64; BLOCK_SIZE_SCAN_BLOCKS / 64];
     let seconds = best(&mut || mask_stream(&matcher, codes, &mut bits));
     let mut found = Vec::new();
-    scan_blocks::<M, resolver::LinearSeek<'_, u32>>(
-        &cover,
-        checked,
-        check_rows,
-        Check::SUPERSET,
-        &mut found,
-    );
+    scan_blocks::<M, u32>(&cover, checked, check_rows, Check::SUPERSET, &mut found);
     Some((seconds, found))
 }
 

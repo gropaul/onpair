@@ -12,7 +12,7 @@ use crate::core::types::{Token, TokenRange};
 use crate::search::substring::prefilter::ProbeCover;
 use crate::search::substring::prefilter::scan::policy::{Match, Shape, takes};
 use crate::search::substring::prefilter::scan::{
-    BLOCK_SIZE_SCAN_BLOCKS, BLOCK_SIZE_SCAN_ROWS, Check, WORDS, resolver, scan_blocks,
+    BLOCK_SIZE_SCAN_BLOCKS, BLOCK_SIZE_SCAN_ROWS, Check, WORDS, scan_blocks,
 };
 
 fn mask<M: Matcher>(cover: &ProbeCover, codes: &Block) -> Mask {
@@ -393,30 +393,18 @@ fn the_driver_scans_every_block() {
     let at = 2 * BLOCK_SIZE_SCAN_BLOCKS + 40;
     let cover = ProbeCover::new(codes[at..at + 1].to_vec(), vec![]);
     let mut found = Vec::new();
-    scan_blocks::<Table, resolver::LinearSeek<'_, u32>>(
-        &cover,
-        &codes,
-        &row_offsets,
-        Check::SUPERSET,
-        &mut found,
-    );
+    scan_blocks::<Table, u32>(&cover, &codes, &row_offsets, Check::SUPERSET, &mut found);
     assert_eq!(found, vec![at / 64]);
 
     // The same layer at the wide offset width.
     let wide: Vec<u64> = row_offsets.iter().map(|&o| u64::from(o)).collect();
     found.clear();
-    scan_blocks::<Table, resolver::GallopSeek<'_, u64>>(
-        &cover,
-        &codes,
-        &wide,
-        Check::SUPERSET,
-        &mut found,
-    );
+    scan_blocks::<Table, u64>(&cover, &codes, &wide, Check::SUPERSET, &mut found);
     assert_eq!(found, vec![at / 64]);
 }
 
 /// The tail is padded with zeros, so a zero the padding carries must not
-/// reach a resolver, whatever the stream length leaves in the last block.
+/// reach the resolver, whatever the stream length leaves in the last block.
 #[test]
 fn padding_makes_no_candidate() {
     for length in [
@@ -433,7 +421,7 @@ fn padding_makes_no_candidate() {
         let codes: Vec<Token> = (0..length).map(|at| (at % 255 + 1) as Token).collect();
         let row_offsets = vec![0, length as u32];
         let mut found = Vec::new();
-        scan_blocks::<Table, resolver::LinearSeek<'_, u32>>(
+        scan_blocks::<Table, u32>(
             &ProbeCover::new(vec![0 as Token], vec![]),
             &codes,
             &row_offsets,

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Which matcher and which resolver, from the needle set and the region, and
-//! what the scan they make costs.
+//! Which matcher, from the needle set and the region, and what the scan
+//! costs.
 //!
 //! Stage one is decided by the cover alone: K and which halves the cover
 //! has are what a kernel declines it for.
-//! Stage two is decided by the mask it will see, of which only the expected
-//! hit count and the row count are known here.
+//! Stage two is always `GallopSeek`, priced from the expected hit count and
+//! the row count.
 //! [`scan_ns`] adds the two to the alignment walk, so covers of different
 //! shape and selectivity compare on one number. Every constant is a fit under
 //! `bench::fit` to the sweeps in `bench`.
@@ -27,7 +27,6 @@ pub(in crate::search::substring::prefilter) struct Facts {
     /// Codes in the region, which with the hits is the density the
     /// pack-skipping flag turns on.
     pub(in crate::search::substring::prefilter) code_count: usize,
-    pub(in crate::search::substring::prefilter) row_count: usize,
 }
 
 /// What stage one's cost depends on: the cover's counts, with no code
@@ -69,17 +68,9 @@ pub(super) enum Match {
     NibbleN8K,
 }
 
-/// Stage two.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Resolve {
-    LinearSeek,
-    GallopSeek,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::search::substring::prefilter::scan) struct Plan {
     pub(super) matcher: Match,
-    pub(super) resolver: Resolve,
     /// Whether the matcher tests its lanes before packing them, which is a
     /// const the kernel is compiled for rather than a branch it takes.
     pub(super) skip: bool,
@@ -92,7 +83,6 @@ pub(super) const BYTES_PER_CODE: f64 = 2.0;
 pub(super) fn select(cover: &ProbeCover, facts: Facts) -> Plan {
     Plan {
         matcher: select_matcher(Shape::of(cover)),
-        resolver: select_resolver(facts),
         skip: skip_ns_per_code(density(facts)) < 0.0,
     }
 }
@@ -276,34 +266,21 @@ fn scalar(matcher: Match, shape: Shape) -> f64 {
 /// jitter floor, spread 2.6 to 30 ns.
 const WALK_NS_PER_HIT: f64 = 8.0;
 
-/// Stage two: one mask word read in a block that hit, one row `LinearSeek`
-/// emits, one row it walks past, one halving of a `GallopSeek` search.
-/// Fitted on aarch64 Apple M4 Pro, from novel_resolve_2026-09-08_15-35-11.csv,
-/// by `bench::resolver_fit`. The two resolvers sit within 20% of each other
-/// below the crossover and the fit within 35% of its rows, which is the
-/// machine's noise across a run and not a term the model lacks.
-const WORD_NS: f64 = 0.05;
-const LINEAR_SEEK_ROW_NS: f64 = 3.98;
-const LINEAR_SEEK_CROSS_NS: f64 = 0.41;
-const GALLOP_SEEK_STEP_NS: f64 = 3.89;
-
-/// What a resolver pays per emitted row, less the word scan both pay, when
-/// the cursor crosses `g` rows to reach it: the walk is linear in `g`, the
-/// search logarithmic.
-pub(super) fn seek_ns_per_row(resolver: Resolve, g: f64) -> f64 {
-    match resolver {
-        Resolve::LinearSeek => LINEAR_SEEK_ROW_NS + LINEAR_SEEK_CROSS_NS * g,
-        Resolve::GallopSeek => GALLOP_SEEK_STEP_NS * (1.0 + g).log2(),
-    }
-}
+/// Stage two: one mask word read in a block that hit, one halving of the
+/// gallop. Fitted on aarch64 Apple M4 Pro, from
+/// novel_resolve_2026-10-14_17-39-10.csv, by `bench::resolver_fit`, within
+/// 34% of its rows.
+const WORD_NS: f64 = 0.04;
+const GALLOP_SEEK_STEP_NS: f64 = 1.92;
 
 /// Stage two over `words` mask words in blocks that hit, emitting `emitted`
-/// rows with `crossed` rows walked or searched past on the way.
-pub(super) fn stage_two_ns(resolver: Resolve, words: f64, emitted: f64, crossed: f64) -> f64 {
+/// rows with `crossed` rows searched past on the way: log2 of the rows
+/// crossed per emitted row, per emitted row.
+pub(super) fn stage_two_ns(words: f64, emitted: f64, crossed: f64) -> f64 {
     if emitted <= 0.0 {
         return WORD_NS * words;
     }
-    WORD_NS * words + emitted * seek_ns_per_row(resolver, crossed / emitted)
+    WORD_NS * words + emitted * GALLOP_SEEK_STEP_NS * (1.0 + crossed / emitted).log2()
 }
 
 /// Rows the mask is expected to name: a row of `x` expected hits holds one
@@ -311,19 +288,6 @@ pub(super) fn stage_two_ns(resolver: Resolve, words: f64, emitted: f64, crossed:
 /// within 20%.
 fn hit_rows(expected_hits: f64, rows: f64) -> f64 {
     rows * (1.0 - (-expected_hits / rows).exp())
-}
-
-/// Hits per row is the whole of it: it fixes both the rows crossed to reach
-/// a hit row and the hits found once there, so the model decides on the rows
-/// crossed per emitted row alone and the row length enters through it.
-fn select_resolver(facts: Facts) -> Resolve {
-    let rows = facts.row_count as f64;
-    let g = rows / hit_rows(facts.expected_hits as f64, rows).max(1.0);
-    if seek_ns_per_row(Resolve::GallopSeek, g) < seek_ns_per_row(Resolve::LinearSeek, g) {
-        Resolve::GallopSeek
-    } else {
-        Resolve::LinearSeek
-    }
 }
 
 /// The stream a cover would be scanned over.
@@ -335,7 +299,7 @@ pub(in crate::search::substring::prefilter) struct Region {
 
 /// Expected nanoseconds to scan `cover` over `region` and walk every hit,
 /// given the `covered` codes it matches there: stage one at the kernel the
-/// shape gets, stage two at the cheaper resolver, the walk per hit. An empty
+/// shape gets, stage two, the walk per hit. An empty
 /// cover proves no row matches and costs nothing.
 pub(in crate::search::substring::prefilter) fn scan_ns(
     cover: &ProbeCover,
@@ -357,10 +321,7 @@ pub(in crate::search::substring::prefilter) fn scan_ns(
     let emitted = hit_rows(covered, rows);
     let blocks_hit = 1.0 - (-covered / codes * BLOCK_SIZE_SCAN_BLOCKS as f64).exp();
     let words = codes / 64.0 * blocks_hit;
-    let stage_two = [Resolve::LinearSeek, Resolve::GallopSeek]
-        .into_iter()
-        .map(|resolver| stage_two_ns(resolver, words, emitted, rows))
-        .fold(f64::MAX, f64::min);
+    let stage_two = stage_two_ns(words, emitted, rows);
 
     stage_one + stage_two + covered * WALK_NS_PER_HIT
 }

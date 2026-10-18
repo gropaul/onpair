@@ -5,9 +5,9 @@
 //! bit mask to rows. See README.md for the contract between the halves.
 //!
 //! The scan takes any cover with something in it - the points as tokens, the
-//! ranges beside them, or either alone - and picks its own two halves from a
-//! cost model. Every hit is verified against the alignment walk in the
-//! compressed domain, so the rows are exact.
+//! ranges beside them, or either alone - and picks its matcher from a cost
+//! model. Every hit is verified against the alignment walk in the compressed
+//! domain, so the rows are exact.
 //!
 //! Vector kernels are compiled for NEON, AVX2 and AVX-512; a target with
 //! none, or an x86 without AVX2, runs the byte table instead, which is
@@ -24,7 +24,7 @@ mod walk;
 
 use matcher::Matcher;
 pub(in crate::search::substring::prefilter) use policy::{Facts, Region, scan_ns};
-use resolver::Resolver;
+use resolver::GallopSeek;
 pub(in crate::search::substring::prefilter) use walk::Walk;
 
 use super::PrefilterAnalysis;
@@ -85,7 +85,6 @@ fn facts<O: Offset>(
     Some(Facts {
         expected_hits: expected_hits(covered_frequency, total_frequency, input.codes.len()),
         code_count: input.codes.len(),
-        row_count,
     })
 }
 
@@ -241,15 +240,15 @@ impl Check<'_> {
 }
 
 /// Both stages over a whole stream. Rows come out ascending and unique.
-fn scan_blocks<'a, M: Matcher, R: Resolver<'a>>(
+fn scan_blocks<M: Matcher, O: Offset>(
     cover: &ProbeCover,
     codes: &[Token],
-    row_offsets: &'a [R::Offset],
+    row_offsets: &[O],
     check: Check<'_>,
     out: &mut Vec<usize>,
 ) {
     let matcher = M::new(cover);
-    let mut resolver = R::new(row_offsets);
+    let mut resolver = GallopSeek::new(row_offsets);
     let mut bits = [0u64; WORDS];
     blocks(codes, &mut |block, at, valid| {
         // A block the matcher reports empty costs stage two nothing.
@@ -432,7 +431,6 @@ mod tests {
                 // twentieth of the region's.
                 expected_hits: 100,
                 code_count: 2_000,
-                row_count: 200,
             })
         );
     }

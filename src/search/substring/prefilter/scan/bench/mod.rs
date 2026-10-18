@@ -10,7 +10,7 @@
 //! ```
 //!
 //! [`matcher_fit`] is stage one, a matcher against the probe shapes a cover
-//! arrives in. [`resolver_fit`] is stage two, a resolver against one mask per
+//! arrives in. [`resolver_fit`] is stage two, the resolver against one mask per
 //! needle set, so what is timed is the mask-to-rows half alone. Each `sweep`
 //! writes one timestamped CSV to `bench/output/`, which the marimo dashboards
 //! out of tree read, then fits the model to its rows and prints the
@@ -32,8 +32,9 @@ mod utils;
 use std::time::Instant;
 
 use super::matcher::Matcher;
-use super::resolver::Resolver;
+use super::resolver::GallopSeek;
 use super::{BLOCK_SIZE_SCAN_BLOCKS, Check, Isa, Mask, WORDS, blocks};
+use crate::core::offset::Offset;
 use crate::core::types::Token;
 
 /// Timed passes per measurement; the fastest is the one to keep.
@@ -79,14 +80,9 @@ fn mask_stream<M: Matcher>(matcher: &M, codes: &[Token], bits: &mut Mask) {
 /// matcher would report non-empty, in order, into a buffer the passes reuse.
 /// Clearing that buffer and appending to it is the resolver's own cost and is
 /// timed with it.
-fn resolve_stream<'a, R: Resolver<'a>>(
-    mask: &[u64],
-    hit: &[usize],
-    row_offsets: &'a [R::Offset],
-    out: &mut Vec<usize>,
-) {
+fn resolve_stream<O: Offset>(mask: &[u64], hit: &[usize], row_offsets: &[O], out: &mut Vec<usize>) {
     out.clear();
-    let mut resolver = R::new(row_offsets);
+    let mut resolver = GallopSeek::new(row_offsets);
     for &block in hit {
         let bits: &Mask = mask[block * WORDS..][..WORDS].try_into().unwrap();
         resolver.rows(bits, block * BLOCK_SIZE_SCAN_BLOCKS, Check::SUPERSET, out);

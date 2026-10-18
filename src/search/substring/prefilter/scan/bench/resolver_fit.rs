@@ -1,33 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Stage two: the resolvers against one mask per needle set, built once from
-//! the cover itself so no matcher runs while the clock does, and the four
+//! Stage two: the resolver against one mask per needle set, built once from
+//! the cover itself so no matcher runs while the clock does, and the two
 //! constants of `policy::stage_two_ns` fitted to what that measured.
 //!
-//! The sweep's axes are the mask's hit density and the row length, swept
-//! past each other because that is what decides which resolver wins. Rates
-//! are over the code stream, so the two halves of one scan add up; in the
+//! The sweep's axes are the mask's hit density and the row length. Rates are
+//! over the code stream, so the two halves of one scan add up; in the
 //! sparsest bin, where a mask holds a handful of bits, a rate says "no work"
 //! rather than a speed, and the fit leaves such rows out.
 //!
-//! What each resolver's time is linear in, and the work it counts:
+//! What the resolver's time is linear in:
 //!
 //! ```text
-//! words     mask words in the blocks that hit, read by both
-//! emitted   rows the resolver names
-//! crossed   rows the cursor passes to reach them; LinearSeek steps each
-//! searched  emitted · log2(1 + crossed / emitted); GallopSeek halves each
+//! words     mask words in the blocks that hit
+//! searched  emitted · log2(1 + crossed / emitted), one halving each
 //! ```
 //!
-//! The word rate is one constant shared by both resolvers, so the two are
-//! fitted together with the other resolver's terms zeroed on each row.
+//! CSVs from before the linear seek was removed hold its rows beside these;
+//! the fit reads only `gallop_seek` rows.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::super::policy::{Resolve, seek_ns_per_row, stage_two_ns};
+use super::super::policy::stage_two_ns;
 use super::super::{BLOCK_SIZE_SCAN_BLOCKS, blocks, clear_from, resolver};
 use super::loader::{NeedleSet, SAMPLE, load_corpus, load_needles, paths, row_layer};
 use super::utils::{error, file_name, lstsq, read_csv, write_csv};
@@ -56,7 +53,7 @@ const COUNTS: &[usize] = &[1, 16];
 /// stream is shorter than this and runs at its own length, 2.8 Mcodes.
 const CODES: usize = 1 << 22;
 
-/// One measurement of one resolver on one mask over one row layer.
+/// One measurement of the resolver on one mask over one row layer.
 #[derive(Serialize, Deserialize)]
 struct Row {
     stream: String,
@@ -78,25 +75,9 @@ struct Row {
     machine: String,
 }
 
+const RESOLVER: &str = "gallop_seek";
+
 impl Row {
-    fn resolve(&self) -> Resolve {
-        match self.resolver.as_str() {
-            "linear_seek" => Resolve::LinearSeek,
-            _ => Resolve::GallopSeek,
-        }
-    }
-
-    /// What one cell of the sweep is: the stream, needle set and row layer.
-    fn cell(&self) -> (&str, usize, usize, u64, usize) {
-        (
-            &self.stream,
-            self.length,
-            self.count,
-            self.target.to_bits(),
-            self.codes_per_row,
-        )
-    }
-
     /// Nanoseconds over the stream, what the fit works in.
     fn ns(&self) -> f64 {
         self.codes as f64 / self.gbs
@@ -116,22 +97,19 @@ impl Row {
     }
 
     /// Rows with at least one bit and one row to emit: a mask with neither
-    /// is no work, and its rate says nothing about a resolver.
+    /// is no work, and its rate says nothing about the resolver.
     fn has_work(&self) -> bool {
         self.density * self.codes as f64 >= 1.0 && self.emitted() >= 1.0
     }
 
-    /// The row in the joint model's terms.
-    fn terms(&self) -> [f64; 4] {
-        let (words, emitted, crossed) = (self.words(), self.emitted(), self.crossed());
-        match self.resolve() {
-            Resolve::LinearSeek => [words, emitted, crossed, 0.0],
-            Resolve::GallopSeek => [words, 0.0, 0.0, emitted * (1.0 + crossed / emitted).log2()],
-        }
+    /// The row in the model's terms.
+    fn terms(&self) -> [f64; 2] {
+        let (emitted, crossed) = (self.emitted(), self.crossed());
+        [self.words(), emitted * (1.0 + crossed / emitted).log2()]
     }
 
     fn model(&self) -> f64 {
-        stage_two_ns(self.resolve(), self.words(), self.emitted(), self.crossed())
+        stage_two_ns(self.words(), self.emitted(), self.crossed())
     }
 }
 
@@ -174,26 +152,16 @@ fn merge_rows(row_offsets: &[u32], factor: usize) -> Vec<u32> {
     merged
 }
 
-/// One resolver over the stream, checked against the rows the mask names
+/// The resolver over the stream, checked against the rows the mask names
 /// before its time counts.
-fn resolve<'a, R: resolver::Resolver<'a>>(
-    name: &'static str,
-    mask: &[u64],
-    hit: &[usize],
-    row_offsets: &'a [R::Offset],
-    expected: &[usize],
-) -> (&'static str, f64) {
+fn resolve(mask: &[u64], hit: &[usize], row_offsets: &[u32], expected: &[usize]) -> f64 {
     let mut out = Vec::new();
-    let seconds = best(&mut || resolve_stream::<R>(mask, hit, row_offsets, &mut out));
-    assert_eq!(
-        out, *expected,
-        "{name} differs from the rows the mask names"
-    );
-    (name, seconds)
+    let seconds = best(&mut || resolve_stream(mask, hit, row_offsets, &mut out));
+    assert_eq!(out, *expected, "differs from the rows the mask names");
+    seconds
 }
 
-/// Every resolver on one mask before any is timed on the next, at every row
-/// count of [`MERGES`].
+/// The resolver on each mask at every row count of [`MERGES`].
 fn measure(stream: &str, machine: &str, out: &mut Vec<Row>) {
     let (corpus_path, needles_path) = paths(stream, "onpair16");
     let corpus = load_corpus(&corpus_path);
@@ -227,40 +195,23 @@ fn measure(stream: &str, machine: &str, out: &mut Vec<Row>) {
             let row_offsets = merge_rows(&layer, factor);
             let rows = row_offsets.len() - 1;
             let expected = resolver::expected_rows(&mask, &row_offsets);
-            for (name, seconds) in [
-                resolve::<resolver::LinearSeek<'_, u32>>(
-                    "linear_seek",
-                    &mask,
-                    &hit,
-                    &row_offsets,
-                    &expected,
-                ),
-                resolve::<resolver::GallopSeek<'_, u32>>(
-                    "gallop_seek",
-                    &mask,
-                    &hit,
-                    &row_offsets,
-                    &expected,
-                ),
-            ] {
-                out.push(Row {
-                    stream: stream.to_string(),
-                    codes: codes.len(),
-                    rows,
-                    codes_per_row: codes.len() / rows,
-                    resolver: name.to_string(),
-                    length: 1,
-                    count: set.count,
-                    target: set.target,
-                    achieved: set.achieved,
-                    density: f64::from(bits) / codes.len() as f64,
-                    blocks_hit: hit.len() as f64
-                        / (mask.len() / (BLOCK_SIZE_SCAN_BLOCKS / 64)) as f64,
-                    selectivity: expected.len() as f64 / rows as f64,
-                    gbs: codes.len() as f64 / seconds / 1e9,
-                    machine: machine.to_string(),
-                });
-            }
+            let seconds = resolve(&mask, &hit, &row_offsets, &expected);
+            out.push(Row {
+                stream: stream.to_string(),
+                codes: codes.len(),
+                rows,
+                codes_per_row: codes.len() / rows,
+                resolver: RESOLVER.to_string(),
+                length: 1,
+                count: set.count,
+                target: set.target,
+                achieved: set.achieved,
+                density: f64::from(bits) / codes.len() as f64,
+                blocks_hit: hit.len() as f64 / (mask.len() / (BLOCK_SIZE_SCAN_BLOCKS / 64)) as f64,
+                selectivity: expected.len() as f64 / rows as f64,
+                gbs: codes.len() as f64 / seconds / 1e9,
+                machine: machine.to_string(),
+            });
         }
     }
     if empty > 0 {
@@ -268,73 +219,19 @@ fn measure(stream: &str, machine: &str, out: &mut Vec<Row>) {
     }
 }
 
-/// Rows crossed per emitted row above which the search beats the walk. From
-/// g = 2: at g = 1 every row hits and the two constants sit within the fit's
-/// error of each other, which is not a crossover.
-fn crossover(seek: impl Fn(Resolve, f64) -> f64) -> f64 {
-    let mut g = 2.0;
-    while g < 1e7 {
-        if seek(Resolve::GallopSeek, g) < seek(Resolve::LinearSeek, g) {
-            return g;
-        }
-        g *= 1.001;
-    }
-    f64::INFINITY
-}
-
-/// Mean relative error, in percent, of `predict` over the rows of one
-/// resolver.
-fn resolver_error(row: &[&Row], resolver: Resolve, predict: impl Fn(&Row) -> f64) -> f64 {
-    let point: Vec<(f64, f64)> = row
-        .iter()
-        .filter(|row| row.resolve() == resolver)
-        .map(|row| (predict(row), row.ns()))
-        .collect();
-    error(&point, |predicted| predicted)
-}
-
-/// How the compiled model does against always picking the measured winner,
-/// over the cells that measured both resolvers: the share it gets right, and
-/// the time given up on average and at worst, in percent.
-fn score(row: &[&Row]) -> (f64, f64, f64) {
-    let mut cell: BTreeMap<_, Vec<&Row>> = BTreeMap::new();
-    for row in row {
-        cell.entry(row.cell()).or_default().push(row);
-    }
-    let (mut right, mut lost, mut worst, mut count) = (0, 0.0, 0.0, 0);
-    for pair in cell.into_values().filter(|pair| pair.len() == 2) {
-        let picked = pair
-            .iter()
-            .min_by(|a, b| a.model().total_cmp(&b.model()))
-            .unwrap();
-        let fastest = pair
-            .iter()
-            .min_by(|a, b| a.ns().total_cmp(&b.ns()))
-            .unwrap();
-        let gave_up = picked.ns() / fastest.ns() - 1.0;
-        right += usize::from(picked.resolver == fastest.resolver);
-        lost += gave_up;
-        worst = f64::max(worst, gave_up);
-        count += 1;
-    }
-    let count = count.max(1) as f64;
-    (
-        100.0 * right as f64 / count,
-        100.0 * lost / count,
-        100.0 * worst,
-    )
-}
-
 /// The model fitted to `rows`, per machine, against the model compiled in.
 fn fit(rows: &[Row], source: &str) {
     let mut group: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
-    for row in rows.iter().filter(|row| row.has_work()) {
+    for row in rows
+        .iter()
+        .filter(|row| row.resolver == RESOLVER && row.has_work())
+    {
         group.entry(&row.machine).or_default().push(row);
     }
-    let mut fitted: BTreeMap<&str, [f64; 4]> = BTreeMap::new();
+    let mut fitted: BTreeMap<&str, [f64; 2]> = BTreeMap::new();
     for (&machine, row) in &group {
-        let point: Vec<([f64; 4], f64)> = row.iter().map(|row| (row.terms(), row.ns())).collect();
-        let beta @ [word, per_row, cross, step] = lstsq(&point);
+        let point: Vec<([f64; 2], f64)> = row.iter().map(|row| (row.terms(), row.ns())).collect();
+        let beta @ [word, step] = lstsq(&point);
         if beta.iter().any(|&b| b < 0.0) {
             println!(
                 "\n{machine}: a term fitted negative, so the fit is borrowing from a collinear one"
@@ -347,50 +244,21 @@ fn fit(rows: &[Row], source: &str) {
                 .map(|(x, b)| x * b)
                 .sum::<f64>()
         };
+        let error_of = |predict: &dyn Fn(&Row) -> f64| {
+            let point: Vec<(f64, f64)> = row.iter().map(|row| (predict(row), row.ns())).collect();
+            error(&point, |predicted| predicted)
+        };
         println!("\n{machine}, {} rows with work in them", row.len());
         println!(
-            "  {:<12} {:<34} {:>6} {:>7}",
-            "resolver", "fitted ns", "fit%", "model%"
-        );
-        println!("  {:<12} {word:.2} per word", "both");
-        for (resolver, name, terms) in [
-            (
-                Resolve::LinearSeek,
-                "linear_seek",
-                format!("{per_row:.2} per row + {cross:.2} per crossed"),
-            ),
-            (
-                Resolve::GallopSeek,
-                "gallop_seek",
-                format!("{step:.2} per halving"),
-            ),
-        ] {
-            println!(
-                "  {name:<12} {terms:<34} {:>6.1} {:>7.1}",
-                resolver_error(row, resolver, fit),
-                resolver_error(row, resolver, Row::model)
-            );
-        }
-        let g_fit = crossover(|resolver, g| match resolver {
-            Resolve::LinearSeek => per_row + cross * g,
-            Resolve::GallopSeek => step * (1.0 + g).log2(),
-        });
-        println!(
-            "  gallop_seek above g = {g_fit:.0} rows crossed per emitted row, one hit row in {:.3}; the compiled model says {:.0}",
-            1.0 / g_fit,
-            crossover(seek_ns_per_row)
-        );
-        let (right, lost, worst) = score(row);
-        println!(
-            "  the compiled model picks the measured winner in {right:.0}% of cells, giving up {lost:.1}% on average and {worst:.0}% at worst"
+            "  {word:.2} ns per word + {step:.2} per halving, fit {:.1}%, compiled model {:.1}%",
+            error_of(&fit),
+            error_of(&Row::model)
         );
         fitted.insert(machine, beta);
     }
-    for (&machine, [word, per_row, cross, step]) in &fitted {
+    for (&machine, [word, step]) in &fitted {
         println!("\n/// Fitted on {machine}, from {source}.");
         println!("const WORD_NS: f64 = {word:.2};");
-        println!("const LINEAR_SEEK_ROW_NS: f64 = {per_row:.2};");
-        println!("const LINEAR_SEEK_CROSS_NS: f64 = {cross:.2};");
         println!("const GALLOP_SEEK_STEP_NS: f64 = {step:.2};");
     }
 }

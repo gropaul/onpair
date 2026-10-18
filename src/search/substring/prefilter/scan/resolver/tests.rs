@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-//! Every resolver against [`expected_rows`], on the same masks and layers.
+//! The resolver against [`expected_rows`], at both offset widths.
 
-use super::{GallopSeek, LinearSeek, Mask, Resolver, expected_rows};
+use super::{GallopSeek, Mask, expected_rows};
+use crate::core::offset::Offset;
 use crate::search::substring::prefilter::scan::{BLOCK_SIZE_SCAN_BLOCKS, Check, WORDS};
 
 /// Blocks per case: enough that a row can span one whole block and still
@@ -11,11 +12,11 @@ use crate::search::substring::prefilter::scan::{BLOCK_SIZE_SCAN_BLOCKS, Check, W
 const BLOCKS: usize = 4;
 const CODES: usize = BLOCKS * BLOCK_SIZE_SCAN_BLOCKS;
 
-/// One resolver over a whole mask, block by block, skipping the empty blocks
+/// The resolver over a whole mask, block by block, skipping the empty blocks
 /// the matcher's flag would have skipped.
-fn resolve<'a, R: Resolver<'a>>(mask: &[u64], row_offsets: &'a [R::Offset]) -> Vec<usize> {
+fn resolve<O: Offset>(mask: &[u64], row_offsets: &[O]) -> Vec<usize> {
     let mut out = Vec::new();
-    let mut resolver = R::new(row_offsets);
+    let mut resolver = GallopSeek::new(row_offsets);
     for (block, bits) in mask.chunks_exact(WORDS).enumerate() {
         let bits: &Mask = bits.try_into().unwrap();
         if bits.iter().any(|&set| set != 0) {
@@ -43,34 +44,16 @@ fn expected(mask: &[u64], row_offsets: &[u32]) -> Vec<usize> {
     rows
 }
 
-fn every_resolver(case: &str, mask: &[u64], row_offsets: &[u32]) {
+fn resolves(case: &str, mask: &[u64], row_offsets: &[u32]) {
     let expected = expected(mask, row_offsets);
-    assert_eq!(
-        resolve::<LinearSeek<'_, u32>>(mask, row_offsets),
-        expected,
-        "skip on {case}"
-    );
-    assert_eq!(
-        resolve::<GallopSeek<'_, u32>>(mask, row_offsets),
-        expected,
-        "gallop on {case}"
-    );
-    // The same layer at the wide offset width, which a resolver reads in
+    assert_eq!(resolve(mask, row_offsets), expected, "{case}");
+    // The same layer at the wide offset width, which the resolver reads in
     // place rather than narrowing.
     let wide: Vec<u64> = row_offsets
         .iter()
         .map(|&offset| u64::from(offset))
         .collect();
-    assert_eq!(
-        resolve::<LinearSeek<'_, u64>>(mask, &wide),
-        expected,
-        "skip at u64 on {case}"
-    );
-    assert_eq!(
-        resolve::<GallopSeek<'_, u64>>(mask, &wide),
-        expected,
-        "gallop at u64 on {case}"
-    );
+    assert_eq!(resolve(mask, &wide), expected, "u64 on {case}");
 }
 
 /// A row layer over the whole stream: rows of `codes` codes, the last one
@@ -136,8 +119,8 @@ fn layers() -> Vec<(String, Vec<u32>)> {
 #[test]
 fn agree_on_every_density() {
     for (name, row_offsets) in layers() {
-        every_resolver(&format!("{name}, empty"), &empty_mask(), &row_offsets);
-        every_resolver(
+        resolves(&format!("{name}, empty"), &empty_mask(), &row_offsets);
+        resolves(
             &format!("{name}, full"),
             &vec![u64::MAX; CODES / 64],
             &row_offsets,
@@ -151,7 +134,7 @@ fn agree_on_every_density() {
             BLOCK_SIZE_SCAN_BLOCKS,
             5 * BLOCK_SIZE_SCAN_BLOCKS / 4,
         ] {
-            every_resolver(
+            resolves(
                 &format!("{name}, every {stride}th code"),
                 &strided(stride),
                 &row_offsets,
@@ -160,7 +143,7 @@ fn agree_on_every_density() {
     }
 }
 
-/// The bits a resolver has to read but must not emit twice: two hits in one
+/// The bits the resolver has to read but must not emit twice: two hits in one
 /// row, on either side of a block boundary.
 #[test]
 fn agree_on_a_row_hit_in_two_blocks() {
@@ -190,7 +173,7 @@ fn agree_on_a_row_hit_in_two_blocks() {
             vec![1],
             "row 1 not emitted once for {pair:?}"
         );
-        every_resolver(&format!("hits at {pair:?}"), &mask, &row_offsets);
+        resolves(&format!("hits at {pair:?}"), &mask, &row_offsets);
     }
 }
 
@@ -202,7 +185,7 @@ fn agree_on_the_ends_of_the_stream() {
         for code in [0, CODES - 1] {
             let mut mask = empty_mask();
             mask[code / 64] |= 1 << (code % 64);
-            every_resolver(&format!("hit at {code}"), &mask, &layer);
+            resolves(&format!("hit at {code}"), &mask, &layer);
         }
     }
 }
@@ -227,6 +210,6 @@ fn agree_on_one_hit_after_many_rows() {
         mask[code / 64] |= 1 << (code % 64);
         let rows = expected(&mask, &row_offsets);
         assert_eq!(rows, vec![code / 3], "lost the hit at {code}");
-        every_resolver(&format!("one hit at {code}"), &mask, &row_offsets);
+        resolves(&format!("one hit at {code}"), &mask, &row_offsets);
     }
 }

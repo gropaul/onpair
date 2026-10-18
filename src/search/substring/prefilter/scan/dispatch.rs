@@ -6,8 +6,8 @@
 use super::matcher::{self, Matcher};
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::matcher::{MAX_BATCHES, PER_BATCH};
-use super::policy::{Match, Plan, Resolve};
-use super::{Check, resolver, scan_blocks, scan_rows};
+use super::policy::{Match, Plan};
+use super::{Check, scan_blocks, scan_rows};
 use crate::core::offset::Offset;
 use crate::core::types::Token;
 use crate::search::substring::prefilter::ProbeCover;
@@ -24,7 +24,7 @@ pub(super) fn run<O: Offset>(
 ) {
     macro_rules! with {
         ($m:ty) => {
-            with::<O, $m>(plan, cover, codes, row_offsets, check, sel, out)
+            with::<O, $m>(cover, codes, row_offsets, check, sel, out)
         };
     }
     // The same kernel compiled with the pack skipped, `S`, and without, `P`.
@@ -77,9 +77,8 @@ pub(super) fn run<O: Offset>(
     }
 }
 
-/// `M` over `sel` alone, or over every block under the planned resolver.
+/// `M` over `sel` alone, or over every block.
 fn with<O: Offset, M: Matcher>(
-    plan: Plan,
     cover: &ProbeCover,
     codes: &[Token],
     row_offsets: &[O],
@@ -87,13 +86,8 @@ fn with<O: Offset, M: Matcher>(
     sel: Option<&[u32]>,
     out: &mut Vec<usize>,
 ) {
-    match (sel, plan.resolver) {
-        (Some(sel), _) => scan_rows::<M, O>(cover, codes, row_offsets, sel, check, out),
-        (None, Resolve::LinearSeek) => {
-            scan_blocks::<M, resolver::LinearSeek<'_, O>>(cover, codes, row_offsets, check, out)
-        }
-        (None, Resolve::GallopSeek) => {
-            scan_blocks::<M, resolver::GallopSeek<'_, O>>(cover, codes, row_offsets, check, out)
-        }
+    match sel {
+        Some(sel) => scan_rows::<M, O>(cover, codes, row_offsets, sel, check, out),
+        None => scan_blocks::<M, O>(cover, codes, row_offsets, check, out),
     }
 }
